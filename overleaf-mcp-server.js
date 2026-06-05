@@ -778,7 +778,7 @@ async function readContext(projectKey, project) {
 
 // MCP server
 const server = new Server(
-  { name: 'overleaf-mcp-server', version: '2.4.1' },
+  { name: 'overleaf-mcp-server', version: '2.5.0' },
   { capabilities: { tools: {} } }
 );
 

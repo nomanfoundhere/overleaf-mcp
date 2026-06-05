@@ -93,6 +93,11 @@ Add `cleanAfterClone: true` (optionally `readUrl`) when the Overleaf project was
 | `upload_file` | Upload binary file(s) (PNG/PDF figures) from a local disk path into the project + push. `write_file`/`edit_file` are text-only. Single (`srcPath`+`destPath`) or batch (`files: [{srcPath, destPath}]`, one commit). Existing files need `baseSha` (single) or `overwrite: true`. Path-confined to the repo. |
 | `compile_file` | Compile with `latexmk` from the repo root (LuaLaTeX default), so the project `.latexmkrc`, reruns, and bib processing all apply; reports errors, undefined refs, and overfull boxes. |
 | `verify_build` | Clean-from-scratch compile + a PASS/FAIL verdict on the done-bar: PASS only with a PDF and zero errors / undefined refs / undefined citations. Reports page count; overfull/underfull are warnings. The final gate before calling a writing task done. |
+| `search_text` | Grep tracked files (regex default; `fixed`/`ignoreCase`/`extension`). Read-only; returns `file:line:match`. |
+| `add_citation` | Append a BibTeX entry to `refs.bib` (refuses a duplicate key) + push. |
+| `cite_lint` | Report undefined (`\cite` with no entry) and unused (entry never cited) citations. Read-only. |
+| `checkpoint` | Mark a local rollback point (tag `mcp-snap/<label>`) before a risky edit. |
+| `restore` | Roll back to a checkpoint via a forward commit + push (no force, no rewrite). |
 | `status_summary` | High-level project status. |
 
 ## Project autodetect
