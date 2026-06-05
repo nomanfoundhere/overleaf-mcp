@@ -806,6 +806,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'upload_file',
+      description: 'Upload a binary file (PNG/PDF figure, etc.) from a local disk path INTO the Overleaf project and push. write_file/edit_file are UTF-8 only — use this for binaries. Single: srcPath + destPath. Batch (one commit for a figure set): files: [{srcPath, destPath}, ...]. Existing dest files need baseSha (single mode, from read_file) or overwrite:true. After uploading, reference each figure with \\includegraphics{...} via edit_file, then compile_file.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          srcPath: { type: 'string', description: 'Absolute local path of the file to upload (single mode).' },
+          destPath: { type: 'string', description: 'Path inside the Overleaf project, e.g. figures/fig1.png (single mode).' },
+          files: {
+            type: 'array',
+            description: 'Batch mode: list of {srcPath, destPath}. One commit + push for the whole set. baseSha is ignored in batch mode.',
+            items: { type: 'object', properties: { srcPath: { type: 'string' }, destPath: { type: 'string' } }, required: ['srcPath', 'destPath'] },
+          },
+          baseSha: { type: 'string', description: 'Single-file mode only: baseSha from read_file; a stale value is refused. Ignored in batch.' },
+          overwrite: { type: 'boolean', description: 'Replace existing dest file(s). Required to overwrite in batch mode.' },
+          commitMessage: { type: 'string' },
+          projectName: { type: 'string' },
+        },
+      },
+    },
+    {
       name: 'status_summary',
       description: 'High-level project status: file count, main file, sections.',
       inputSchema: {
@@ -1137,6 +1157,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const tail = res.pushed
           ? `Wrote ${args.filePath}. NEXT STEP: call compile_file on the project main .tex to verify the build.`
           : `No change detected for ${args.filePath} (${res.reason}).`;
+        return { content: [{ type: 'text', text: tail }] };
+      }
+
+      case 'upload_file': {
+        const { client } = await getClient(args.projectName);
+        const res = await client.uploadFile({
+          srcPath: args.srcPath,
+          destPath: args.destPath,
+          files: args.files,
+          baseSha: args.baseSha,
+          overwrite: args.overwrite,
+          commitMessage: args.commitMessage,
+        });
+        const tail = res.pushed
+          ? `Uploaded ${res.files.length} file(s): ${res.files.join(', ')}. NEXT: reference each figure with \\includegraphics{...} via edit_file, then compile_file.`
+          : `No upload performed (${res.reason}).`;
         return { content: [{ type: 'text', text: tail }] };
       }
 
