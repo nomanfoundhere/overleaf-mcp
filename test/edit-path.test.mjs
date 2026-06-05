@@ -58,3 +58,44 @@ test('_pushWithMerge refuses + resets clean on an overlapping divergence', async
   const { stdout } = await git(c.repoPath, ['status', '--porcelain']);
   assert.equal(stdout.trim(), '');              // clean, no merge leftovers
 });
+
+test('editFile replaces a unique anchor and pushes', async () => {
+  const r = await makeRemote({ 'main.tex': 'alpha beta gamma\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  const res = await c.editFile('main.tex', 'beta', 'BETA');
+  assert.equal(res.pushed, true);
+  assert.equal(await c.readFile('main.tex'), 'alpha BETA gamma\n');
+});
+
+test('editFile refuses when the anchor is absent (changed on Overleaf)', async () => {
+  const r = await makeRemote({ 'main.tex': 'alpha\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  await assert.rejects(() => c.editFile('main.tex', 'ZZZ', 'q'), /not found/i);
+});
+
+test('editFile refuses an ambiguous anchor without replaceAll', async () => {
+  const r = await makeRemote({ 'main.tex': 'x x\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  await assert.rejects(() => c.editFile('main.tex', 'x', 'y'), /2 times|ambiguous/i);
+});
+
+test('editFile replaceAll replaces every occurrence', async () => {
+  const r = await makeRemote({ 'main.tex': 'x x x\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  await c.editFile('main.tex', 'x', 'y', true);
+  assert.equal(await c.readFile('main.tex'), 'y y y\n');
+});
+
+test('editFile absorbs a non-overlapping concurrent edit (pull-first)', async () => {
+  const r = await makeRemote({ 'main.tex': 'top\nbottom\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  await c.cloneOrPull();
+  await r.remoteEdit('main.tex', 'TOP\nbottom\n');     // remote changes a different line
+  await c.editFile('main.tex', 'bottom', 'BOTTOM');    // pull-first picks up TOP
+  assert.equal(await c.readFile('main.tex'), 'TOP\nBOTTOM\n');
+});

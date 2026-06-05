@@ -291,6 +291,41 @@ class OverleafGitClient {
     return await this.commitAndPush(commitMessage, { addPath: filePath });
   }
 
+  // Anchored, conflict-safe edit. Pulls first (absorbing non-overlapping Overleaf
+  // edits), then replaces oldString. A missing anchor means the user changed that
+  // region (overlap) or the string was wrong -> refuse, nothing written.
+  async editFile(filePath, oldString, newString, replaceAll = false, commitMessage) {
+    await this.cloneOrPull();
+    const fullPath = path.join(this.repoPath, filePath);
+    let content;
+    try { content = await readFile(fullPath, 'utf-8'); }
+    catch { throw new Error(`File not found in project: ${filePath}`); }
+
+    const parts = content.split(oldString);
+    const count = parts.length - 1;
+    if (count === 0) {
+      throw new Error(`oldString not found in ${filePath}. It may have changed on Overleaf since you read it (an overlapping edit) — re-read the file and retry.`);
+    }
+    if (count > 1 && !replaceAll) {
+      throw new Error(`oldString matches ${count} times in ${filePath}; pass replaceAll: true or include more surrounding context to make it unique.`);
+    }
+    const updated = replaceAll ? parts.join(newString) : content.replace(oldString, newString);
+    await writeFile(fullPath, updated, 'utf-8');
+
+    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
+    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
+    await this._git(['-C', this.repoPath, 'add', '--', filePath]);
+    try {
+      await this._git(['-C', this.repoPath, 'commit', '-m', commitMessage || `Edit ${filePath} via Claude`]);
+    } catch (e) {
+      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) {
+        return { pushed: false, reason: 'no change (new === old)' };
+      }
+      throw e;
+    }
+    return await this._pushWithMerge();
+  }
+
   async getSectionContent(filePath, sectionTitle) {
     const content = await this.readFile(filePath);
     const sections = await this.getSections(filePath);
