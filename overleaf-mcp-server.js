@@ -179,6 +179,17 @@ class OverleafGitClient {
     return await readFile(fullPath, 'utf-8');
   }
 
+  // git blob SHA of a file at the current tip; null if the file isn't tracked.
+  async getBlobSha(filePath) {
+    await this.cloneOrPull();
+    try {
+      const { stdout } = await this._git(['-C', this.repoPath, 'rev-parse', `HEAD:${filePath}`]);
+      return stdout.trim();
+    } catch {
+      return null;
+    }
+  }
+
   async getSections(filePath) {
     const content = await this.readFile(filePath);
     const sections = [];
@@ -534,7 +545,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'read_file',
-      description: 'Read a file from the Overleaf project.',
+      description: 'Read a file from the Overleaf project. The first line of the result is an overleaf-mcp comment carrying the file baseSha (its git blob hash); pass that baseSha to write_file to detect and refuse a clobber of concurrent Overleaf edits.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -880,7 +891,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'read_file': {
         const { client } = await getClient(args.projectName);
         const content = await client.readFile(args.filePath);
-        return { content: [{ type: 'text', text: content }] };
+        const baseSha = await client.getBlobSha(args.filePath);
+        const header = `<!-- overleaf-mcp baseSha: ${baseSha || 'none'} (pass as baseSha to write_file to guard against clobbering Overleaf edits) -->\n`;
+        return { content: [{ type: 'text', text: header + content }] };
       }
 
       case 'get_sections': {
