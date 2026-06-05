@@ -92,6 +92,7 @@ Add `cleanAfterClone: true` (optionally `readUrl`) when the Overleaf project was
 | `write_file` | Create a new file or overwrite one wholesale + push. Existing-file overwrite needs `baseSha` (from `read_file`) or `overwrite: true`; a stale `baseSha` is refused, never merged. Prefer `edit_file` for edits. |
 | `upload_file` | Upload binary file(s) (PNG/PDF figures) from a local disk path into the project + push. `write_file`/`edit_file` are text-only. Single (`srcPath`+`destPath`) or batch (`files: [{srcPath, destPath}]`, one commit). Existing files need `baseSha` (single) or `overwrite: true`. Path-confined to the repo. |
 | `compile_file` | Compile with `latexmk` from the repo root (LuaLaTeX default), so the project `.latexmkrc`, reruns, and bib processing all apply; reports errors, undefined refs, and overfull boxes. |
+| `verify_build` | Clean-from-scratch compile + a PASS/FAIL verdict on the done-bar: PASS only with a PDF and zero errors / undefined refs / undefined citations. Reports page count; overfull/underfull are warnings. The final gate before calling a writing task done. |
 | `status_summary` | High-level project status. |
 
 ## Project autodetect
