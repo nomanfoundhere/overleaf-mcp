@@ -98,6 +98,7 @@ Add `cleanAfterClone: true` (optionally `readUrl`) when the Overleaf project was
 | `cite_lint` | Report undefined (`\cite` with no entry) and unused (entry never cited) citations. Read-only. |
 | `checkpoint` | Mark a local rollback point (tag `mcp-snap/<label>`) before a risky edit. |
 | `restore` | Roll back to a checkpoint via a forward commit + push (no force, no rewrite). |
+| `voice_lint` | Run the configured voice linter (`settings.voiceLinter`, default `/path/to/your/voice_lint.py`) on a `.tex`. Read-only, advisory — reports findings. Use after MCP prose edits (which bypass the local voice hooks). |
 | `status_summary` | High-level project status. |
 
 ## Project autodetect

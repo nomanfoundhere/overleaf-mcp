@@ -3,7 +3,8 @@
     "gitToken": "olp_REPLACE_WITH_YOUR_OVERLEAF_GIT_TOKEN",
     "repoDir": "/Users/you/PDFs/Overleaf GIT",
     "academicRoot": "/Users/you/PDFs/School/Textbooks and Syllabus",
-    "ssaSubdir": "MY SSAs"
+    "ssaSubdir": "MY SSAs",
+    "voiceLinter": "python3 /path/to/your/voice_lint.py"
   },
   "projects": {
     "default": {
