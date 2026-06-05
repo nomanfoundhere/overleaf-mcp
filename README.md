@@ -33,14 +33,17 @@ Editing a LaTeX project through an AI normally means one of two bad options: pas
 
 ## Install
 
-For most clients the whole install is a few lines of JSON: point the client at the published npm package via `npx`, which fetches and runs it on demand with nothing to clone or update by hand.
+**Recommended: npx.** Nothing to clone, nothing to keep updated by hand. The whole install is a few lines of JSON in your MCP client, plus two values from Overleaf.
+
+1. Get your two values: an Overleaf **git token** (Account Settings → Git Integration → create token) and your **project id** (the `<ID>` in `https://www.overleaf.com/project/<ID>`).
+2. Add this block to your client's config file (locations in the table below):
 
 ```json
 {
   "mcpServers": {
     "overleaf": {
       "command": "npx",
-      "args": ["-y", "overleaf-forge"],
+      "args": ["-y", "overleaf-forge@latest"],
       "env": {
         "OVERLEAF_GIT_TOKEN": "olp_xxxxxxxxxxxxxxxxxxxxxxxx",
         "OVERLEAF_PROJECT_ID": "0123456789abcdef01234567"
@@ -50,7 +53,9 @@ For most clients the whole install is a few lines of JSON: point the client at t
 }
 ```
 
-A token and a project id in that `env` block are the entire setup for a single project, with no config file. This is **env-only mode** (see Configuration for the multi-project path).
+3. Restart the client (or reload its MCP servers). That's it.
+
+`npx` fetches and runs the published package on demand. The token and project id are the entire setup for a single project, with no config file (this is **env-only mode**). `@latest` means each client restart picks up the newest published version automatically; pin `overleaf-forge@2.7.1` instead to freeze a version. For multiple projects, per-project contexts, or the SSA bootstrap, see [Configuration](#configuration).
 
 To hack on the server instead, run it from source:
 
@@ -74,6 +79,20 @@ The `mcpServers` schema is identical across clients; only the file location diff
 | Cursor and others on the Cursor `mcp.json` convention | their `mcp.json` |
 
 Restart the client (or reload its MCP servers) after editing, so it spawns the server with the new config.
+
+## Updating
+
+**As a user.** With `overleaf-forge@latest` in your config (the recommended form), restart the client or reload its MCP servers and it fetches the newest published version. If you pinned a version (`overleaf-forge@2.7.1`), change the number. If `npx` seems to keep running an old version, clear its cache with `npx clear-npx-cache` and restart.
+
+**As the maintainer (publishing a new release).** From the repository:
+
+```bash
+npm version patch        # or minor / major; bumps package.json and tags
+npm publish              # enter your npm 2FA one-time code when prompted
+git push --follow-tags   # push the commit and the version tag
+```
+
+Anyone on `@latest` picks the new version up on their next client restart.
 
 ## Configuration
 

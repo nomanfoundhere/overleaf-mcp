@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { readFile, writeFile, access, mkdir, readdir, stat, rm, rename, copyFile } from 'fs/promises';
-import { existsSync, realpathSync } from 'fs';
+import { existsSync, realpathSync, readFileSync } from 'fs';
 import { promisify } from 'util';
 import { execFile as execFileCallback } from 'child_process';
 import path from 'path';
@@ -29,6 +29,12 @@ const execFile = promisify(execFileCallback);
 // somewhere writable, because the package can run from an immutable npm/npx
 // cache. Anything a user edits resolves user-copy-first, bundled-default-last.
 const PACKAGE_DIR = __dirname;
+
+// Single source of truth for the version: read it from the shipped package.json
+// so `npm version` is the only place a release number changes. Fall back to '0.0.0'
+// if package.json is somehow unreadable (never fatal).
+let PKG_VERSION = '0.0.0';
+try { PKG_VERSION = JSON.parse(readFileSync(path.join(PACKAGE_DIR, 'package.json'), 'utf-8')).version || PKG_VERSION; } catch { /* keep fallback */ }
 
 // Expand a leading ~ to the user's home. Plain join elsewhere assumes absolute.
 function expandHome(p) {
@@ -927,7 +933,7 @@ async function readContext(projectKey, project) {
 
 // MCP server
 const server = new Server(
-  { name: 'overleaf-forge', version: '2.7.1' },
+  { name: 'overleaf-forge', version: PKG_VERSION },
   { capabilities: { tools: {} } }
 );
 
