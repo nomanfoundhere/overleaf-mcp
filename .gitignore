@@ -2,6 +2,7 @@ node_modules/
 temp/
 projects.json
 contexts/
+docs/
 .env
 *.log
 .DS_Store
