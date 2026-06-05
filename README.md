@@ -33,23 +33,79 @@ Editing a LaTeX project through an AI normally means one of two bad options: pas
 
 ## Install
 
+For most clients the whole install is a few lines of JSON: point the client at the published npm package via `npx`, which fetches and runs it on demand with nothing to clone or update by hand.
+
+```json
+{
+  "mcpServers": {
+    "overleaf": {
+      "command": "npx",
+      "args": ["-y", "overleaf-mcp-server"],
+      "env": {
+        "OVERLEAF_GIT_TOKEN": "olp_xxxxxxxxxxxxxxxxxxxxxxxx",
+        "OVERLEAF_PROJECT_ID": "0123456789abcdef01234567"
+      }
+    }
+  }
+}
+```
+
+A token and a project id in that `env` block are the entire setup for a single project, with no config file. This is **env-only mode** (see Configuration for the multi-project path).
+
+To hack on the server instead, run it from source:
+
 ```bash
 git clone https://github.com/nomanfoundhere/overleaf-mcp.git
 cd overleaf-mcp
 npm install
-cp projects.example.json projects.json   # then edit projects.json (see Configuration)
 ```
+
+Then use `"command": "node", "args": ["/absolute/path/to/overleaf-mcp-server.js"]` in the client config in place of the `npx` form.
+
+### Wiring into specific clients
+
+The `mcpServers` schema is identical across clients; only the file location differs. Put the `npx` block above inside each.
+
+| Client | Config file |
+| --- | --- |
+| Claude Code | `~/.claude.json` |
+| Claude Desktop | `claude_desktop_config.json` (Settings → Developer → Edit Config) |
+| LM Studio | `~/.lmstudio/mcp.json` (or the app's *Edit mcp.json*) |
+| Cursor and others on the Cursor `mcp.json` convention | their `mcp.json` |
+
+Restart the client (or reload its MCP servers) after editing, so it spawns the server with the new config.
 
 ## Configuration
 
-`projects.json` (gitignored, since it holds your token) has two halves: global `settings` and a map of `projects`.
+Two modes, smallest first.
+
+### Env-only mode (one project, no files)
+
+Set `OVERLEAF_GIT_TOKEN` and `OVERLEAF_PROJECT_ID` in the client's `env` block (as in Install). The server builds a single `default` project from them and lands clones under `~/.overleaf-mcp/repos/`. This covers the common single-project case completely.
+
+| Env var | Meaning |
+| --- | --- |
+| `OVERLEAF_GIT_TOKEN` | Overleaf git token. Required, here or in `projects.json`. |
+| `OVERLEAF_PROJECT_ID` | The id from `https://www.overleaf.com/project/<ID>`. Its presence triggers env-only mode. |
+| `OVERLEAF_PROJECT_NAME` | Optional display name for the synthesized project. |
+| `OVERLEAF_MCP_HOME` | Optional. Override the data home (default `~/.overleaf-mcp`). |
+| `OVERLEAF_MCP_TEMPLATES` | Optional. Override the templates directory. |
+
+### Config-file mode (multiple projects, contexts, bootstrap)
+
+For more than one project, per-project contexts, or the SSA bootstrap, use a `projects.json`. Scaffold it:
+
+```bash
+npx overleaf-mcp-server init
+```
+
+That creates `~/.overleaf-mcp/projects.json` from the example and copies the editable templates into `~/.overleaf-mcp/templates/`. Then fill in the config:
 
 ```json
 {
   "settings": {
     "gitToken": "olp_xxxxxxxxxxxxxxxxxxxxxxxx",
-    "repoDir": "/Users/you/Overleaf",
-    "voiceLinter": "python3 /path/to/your/voice_lint.py"
+    "repoDir": "/Users/you/Overleaf"
   },
   "projects": {
     "default": {
@@ -65,12 +121,17 @@ cp projects.example.json projects.json   # then edit projects.json (see Configur
 | --- | --- |
 | `settings.gitToken` | Overleaf git token, used by every project (or set `OVERLEAF_GIT_TOKEN`). A per-project `gitToken` overrides it. |
 | `settings.repoDir` | Where project clones land by default (`repoDir/<name>`). A per-project `localPath` overrides it. |
-| `settings.voiceLinter` | Optional. Command `voice_lint` runs on a file (default `python3 /path/to/your/voice_lint.py`). |
+| `settings.templatesDir` | Optional. Directory of scaffold templates, overriding the bundled defaults. |
+| `settings.voiceLinter` | Optional. Command `voice_lint` runs on a file. |
 | `projects.<key>.projectId` | The id from `https://www.overleaf.com/project/<ID>`. |
 | `projects.<key>.cwd` | Directory you launch the client from for this project; used to auto-detect the active project. |
 | `projects.<key>.localPath` | Explicit clone location (optional). |
 
 `projects.json` is re-read on every call, so registering a project or rotating the token takes effect immediately, with no restart. (Code changes do need a restart; the server loads its `.js` once at startup.)
+
+### Where files live
+
+User state (the `projects.json`, per-project `contexts/`, customised `templates/`, and the git clones) lives in the **data home**, resolved as: `$OVERLEAF_MCP_HOME` if set, else the package directory when it already holds a `projects.json` (so an existing local clone keeps working untouched), else `~/.overleaf-mcp`. Bundled, read-only defaults (the templates and the stock writing-guidelines) ship inside the package; a copy you place in the data home overrides the bundled one.
 
 ### Getting Overleaf credentials
 
@@ -79,24 +140,30 @@ cp projects.example.json projects.json   # then edit projects.json (see Configur
 
 ### Per-project context (optional but recommended)
 
-Assignment-specific notes (terminology, deadlines, structure constraints, pinned decisions) live in `contexts/<key>.md`, and shared writing rules in `writing-guidelines.md`. Both are re-read from disk on every `get_context` call, so you can edit them mid-session. `get_context` is the intended first call of a writing session.
+Assignment-specific notes (terminology, deadlines, structure constraints, pinned decisions) live in `contexts/<key>.md` under the data home, and shared writing rules in `writing-guidelines.md`. Both are re-read on every `get_context` call, so you can edit them mid-session. `get_context` is the intended first call of a writing session.
 
-## Wiring into an MCP client
+### Customising the templates
 
-Claude Desktop (`claude_desktop_config.json`) or Claude Code (`~/.claude.json`):
+The SSA bootstrap scaffolds from two templates: `main.tex` (the document skeleton) and `context-scaffold.md` (the project-questions checklist). Defaults ship with the package. To change them, run `npx overleaf-mcp-server init` (which copies both into `~/.overleaf-mcp/templates/`) and edit them in place, or point `settings.templatesDir` / `OVERLEAF_MCP_TEMPLATES` at your own directory. The tokens `__SSA_NAME__`, `__SSA_TITLE__`, `__SSA_DATE__`, and `__OVERLEAF_READ_URL__` are substituted at scaffold time. A missing template falls back to the built-in default, so a partial templates directory never breaks the bootstrap.
 
-```json
-{
-  "mcpServers": {
-    "overleaf": {
-      "command": "node",
-      "args": ["/absolute/path/to/overleaf-mcp/overleaf-mcp-server.js"]
-    }
-  }
-}
+## Install via an AI agent
+
+Hand this to an agent (Claude Code, Cursor, etc.) to set up the server in the current client:
+
+```text
+Install the Overleaf MCP server (npm package: overleaf-mcp-server).
+1. Find this client's MCP config file (Claude Code ~/.claude.json, Claude Desktop's
+   claude_desktop_config.json, or LM Studio ~/.lmstudio/mcp.json).
+2. Add an "overleaf" entry under mcpServers:
+     command: "npx", args: ["-y", "overleaf-mcp-server"]
+   with an env block containing OVERLEAF_GIT_TOKEN and OVERLEAF_PROJECT_ID.
+3. Ask me for my Overleaf git token (Account Settings → Git Integration) and the
+   project id from my project URL. Do not invent them.
+4. For multiple projects or the SSA bootstrap, run `npx overleaf-mcp-server init`
+   and edit ~/.overleaf-mcp/projects.json instead of the env block.
+5. Tell me to restart or reload MCP servers in the client, then call status_summary
+   to confirm it connected.
 ```
-
-Restart the client after editing this (the server process spawns once at startup).
 
 ## Quick start
 

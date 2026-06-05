@@ -7,6 +7,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { readFile, writeFile, access, mkdir, readdir, stat, rm, rename, copyFile } from 'fs/promises';
+import { existsSync } from 'fs';
 import { promisify } from 'util';
 import { execFile as execFileCallback } from 'child_process';
 import path from 'path';
@@ -21,23 +22,150 @@ const __dirname = path.dirname(__filename);
 // helper that reads the token from the environment (see OverleafGitClient._git).
 const execFile = promisify(execFileCallback);
 
-const CONFIG_PATH = path.join(__dirname, 'projects.json');
-const CONTEXTS_DIR = path.join(__dirname, 'contexts');
-const GUIDELINES_PATH = path.join(__dirname, 'writing-guidelines.md');
+// --- Paths: bundled assets vs. writable user state --------------------------
+// Bundled, read-only defaults (templates, the default writing-guidelines) ship
+// inside the package and are read from PACKAGE_DIR. User state (the token
+// config, per-project contexts, customised templates, and git clones) must live
+// somewhere writable, because the package can run from an immutable npm/npx
+// cache. Anything a user edits resolves user-copy-first, bundled-default-last.
+const PACKAGE_DIR = __dirname;
+
+// Expand a leading ~ to the user's home. Plain join elsewhere assumes absolute.
+function expandHome(p) {
+  if (!p) return p;
+  return p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p;
+}
+
+// Where user state lives. Precedence:
+//   1. $OVERLEAF_MCP_HOME                      (explicit override)
+//   2. PACKAGE_DIR, if it already holds a projects.json (existing local clones)
+//   3. ~/.overleaf-mcp                         (fresh npx / global installs)
+// Pure (FS facts injected) so the precedence is unit-testable.
+export function resolveDataHome({ env, packageDir, homeDir, hasPackageConfig }) {
+  const override = (env.OVERLEAF_MCP_HOME || '').trim();
+  if (override) return override.startsWith('~') ? path.join(homeDir, override.slice(1)) : override;
+  if (hasPackageConfig) return packageDir;
+  return path.join(homeDir, '.overleaf-mcp');
+}
+
+// Build a single-project config from environment variables alone, so the server
+// runs with zero config files (the common LM Studio / Claude Desktop case: token
+// and project id passed via the client's `env` block). Returns null when the env
+// doesn't carry enough to act on.
+export function synthesizeConfigFromEnv(env, defaultRepoDir) {
+  const gitToken = env.OVERLEAF_GIT_TOKEN;
+  const projectId = env.OVERLEAF_PROJECT_ID;
+  if (!gitToken || !projectId) return null;
+  return {
+    settings: { gitToken, repoDir: defaultRepoDir },
+    projects: {
+      default: {
+        name: env.OVERLEAF_PROJECT_NAME || 'Overleaf Project',
+        projectId,
+        localPath: path.join(defaultRepoDir, 'default'),
+      },
+    },
+  };
+}
+
+const DATA_HOME = resolveDataHome({
+  env: process.env,
+  packageDir: PACKAGE_DIR,
+  homeDir: os.homedir(),
+  hasPackageConfig: existsSync(path.join(PACKAGE_DIR, 'projects.json')),
+});
+
+const CONFIG_PATH = path.join(DATA_HOME, 'projects.json');
+const CONTEXTS_DIR = path.join(DATA_HOME, 'contexts');
+const DEFAULT_REPO_DIR = path.join(DATA_HOME, 'repos');
+const BUNDLED_TEMPLATES_DIR = path.join(PACKAGE_DIR, 'templates');
+// A user copy in the data home overrides the bundled default writing-guidelines.
+const GUIDELINES_PATH = existsSync(path.join(DATA_HOME, 'writing-guidelines.md'))
+  ? path.join(DATA_HOME, 'writing-guidelines.md')
+  : path.join(PACKAGE_DIR, 'writing-guidelines.md');
+
+// Where scaffold templates (main.tex skeleton, context-scaffold.md) are read.
+// Precedence: settings.templatesDir → $OVERLEAF_MCP_TEMPLATES → ~/.overleaf-mcp/
+// templates (if present) → bundled defaults. Lets a user customise the scaffolds.
+function resolveTemplatesDir(config) {
+  const fromSettings = config?.settings?.templatesDir;
+  if (fromSettings) return expandHome(fromSettings);
+  const fromEnv = (process.env.OVERLEAF_MCP_TEMPLATES || '').trim();
+  if (fromEnv) return expandHome(fromEnv);
+  const inHome = path.join(DATA_HOME, 'templates');
+  if (existsSync(inHome)) return inHome;
+  return BUNDLED_TEMPLATES_DIR;
+}
+
+// Read a named template from the resolved templates dir; null if absent so the
+// caller can fall back to a built-in default (templates must never hard-fail).
+async function loadTemplate(config, filename) {
+  try { return await readFile(path.join(resolveTemplatesDir(config), filename), 'utf-8'); }
+  catch { return null; }
+}
+
+// Built-in fallback for templates/context-scaffold.md, used when the user has
+// not supplied their own. __SSA_NAME__ is substituted at scaffold time.
+const DEFAULT_CONTEXT_SCAFFOLD = `# __SSA_NAME__
+
+> Fill these in. Each block is here because past SSAs have needed it. Drop blocks that genuinely do not apply, but do not leave them blank — empty context is the most common reason Claude drifts.
+
+## Topic and scope
+- What is this SSA actually about? One paragraph in your own words.
+- What is in scope, and what is explicitly out of scope?
+
+## Deadline and submission
+- Hard deadline (date + time):
+- Submission target (Canvas, hand-in, etc.):
+- Page or length limit, if any:
+
+## Collaborators and division of labour
+- Who else is on this SSA:
+- Who is doing what:
+- What you specifically own:
+
+## Pinned decisions
+- Decisions already made that should not be re-litigated mid-draft:
+
+## Source material
+- Lecture notes / chapters / datasheets / papers you are working from:
+- Citation style (default IEEE):
+
+## Structure constraints
+- Required sections (Goals, Summary, Details, etc.) in order:
+- Anything unusual (e.g. an appendix the assignment requires):
+
+## Known unknowns
+- Things that are still open and will need updating:
+
+## Other context
+- Anything else Claude should keep in mind throughout the write-up:
+`;
 
 // Capture the cwd Claude Code spawned this MCP from. Used for project autodetection.
 const SESSION_CWD = process.cwd();
 
 // Re-read on every call so register_project / token rotation / context edits
-// take effect immediately without restarting Claude.
+// take effect immediately without restarting Claude. A missing config is not an
+// error: fall back to env-only mode, then to an empty config so the server still
+// starts and tools return actionable messages instead of dying at spawn.
 async function loadConfig() {
-  const raw = await readFile(CONFIG_PATH, 'utf-8');
-  return JSON.parse(raw);
+  try {
+    const raw = await readFile(CONFIG_PATH, 'utf-8');
+    return JSON.parse(raw);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;   // corrupt / unreadable: surface it
+    const fromEnv = synthesizeConfigFromEnv(process.env, DEFAULT_REPO_DIR);
+    if (fromEnv) return fromEnv;
+    return { settings: {}, projects: {} };
+  }
 }
 
 async function saveConfig(config) {
-  // Write-temp-then-rename so a crash mid-write can't corrupt projects.json
+  // Ensure the data home exists (env-only / fresh installs may not have it yet),
+  // then write-temp-then-rename so a crash mid-write can't corrupt projects.json
   // (it holds the token and every project entry).
+  await mkdir(path.dirname(CONFIG_PATH), { recursive: true });
   const tmp = `${CONFIG_PATH}.tmp`;
   await writeFile(tmp, JSON.stringify(config, null, 2) + '\n', 'utf-8');
   await rename(tmp, CONFIG_PATH);
@@ -52,7 +180,7 @@ function resolveLocalPath(config, projectKey, project) {
   if (config.settings?.repoDir) {
     return path.join(config.settings.repoDir, project.name || projectKey);
   }
-  return path.join(os.tmpdir(), `overleaf-${project.projectId}`);
+  return path.join(DEFAULT_REPO_DIR, project.name || projectKey);
 }
 
 // Default project resolution:
@@ -793,13 +921,13 @@ async function readContext(projectKey, project) {
     if (project?.context) {
       return { source: '(inline in projects.json)', body: project.context };
     }
-    return { source: '(none)', body: `(No context set. Create ${path.relative(__dirname, mdPath)} or call update_context to add notes for this project.)` };
+    return { source: '(none)', body: `(No context set. Create ${path.relative(DATA_HOME,mdPath)} or call update_context to add notes for this project.)` };
   }
 }
 
 // MCP server
 const server = new Server(
-  { name: 'overleaf-mcp-server', version: '2.6.1' },
+  { name: 'overleaf-mcp-server', version: '2.7.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -1151,44 +1279,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           cloneStatus = `✗ Clone failed: ${e.message}\n  (project is still registered; fix the token or id and call list_files to retry)`;
         }
 
-        // Scaffold context md with a question template.
+        // Scaffold context md from the (user-configurable) context-scaffold
+        // template, falling back to the built-in default if none is provided.
         await mkdir(CONTEXTS_DIR, { recursive: true });
         const ctxPath = path.join(CONTEXTS_DIR, `${parsed.slug}.md`);
-        const scaffold = `# ${args.ssaName.trim()}
-
-> Fill these in. Each block is here because past SSAs have needed it. Drop blocks that genuinely do not apply, but do not leave them blank — empty context is the most common reason Claude drifts.
-
-## Topic and scope
-- What is this SSA actually about? One paragraph in your own words.
-- What is in scope, and what is explicitly out of scope?
-
-## Deadline and submission
-- Hard deadline (date + time):
-- Submission target (Canvas, hand-in, etc.):
-- Page or length limit, if any:
-
-## Collaborators and division of labour
-- Who else is on this SSA:
-- Who is doing what:
-- What you specifically own:
-
-## Pinned decisions
-- Decisions already made that should not be re-litigated mid-draft:
-
-## Source material
-- Lecture notes / chapters / datasheets / papers you are working from:
-- Citation style (default IEEE):
-
-## Structure constraints
-- Required sections (Goals, Summary, Details, etc.) in order:
-- Anything unusual (e.g. an appendix the assignment requires):
-
-## Known unknowns
-- Things that are still open and will need updating:
-
-## Other context
-- Anything else Claude should keep in mind throughout the write-up:
-`;
+        const ctxTemplate = await loadTemplate(config, 'context-scaffold.md');
+        const scaffold = (ctxTemplate != null ? ctxTemplate : DEFAULT_CONTEXT_SCAFFOLD)
+          .replaceAll('__SSA_NAME__', args.ssaName.trim());
         try { await access(ctxPath); }
         catch { await writeFile(ctxPath, scaffold, 'utf-8'); }
 
@@ -1216,7 +1313,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `**Workspace:** ${workspaceDir}`,
           `**Overleaf clone:** ${cloneDir}`,
           `**Project key:** \`${parsed.slug}\``,
-          `**Context md:** ${path.relative(__dirname, ctxPath)}`,
+          `**Context md:** ${path.relative(DATA_HOME,ctxPath)}`,
           ``,
           cloneStatus,
         ];
@@ -1278,9 +1375,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         await mkdir(CONTEXTS_DIR, { recursive: true });
         const ctxPath = path.join(CONTEXTS_DIR, `${args.key}.md`);
         try { await access(ctxPath); } catch {
-          await writeFile(ctxPath, `# ${entry.name}\n\n(Context placeholder. Call update_context to fill this in, or edit ${path.relative(__dirname, ctxPath)} directly.)\n`, 'utf-8');
+          await writeFile(ctxPath, `# ${entry.name}\n\n(Context placeholder. Call update_context to fill this in, or edit ${path.relative(DATA_HOME,ctxPath)} directly.)\n`, 'utf-8');
         }
-        return { content: [{ type: 'text', text: `Registered "${args.key}" → ${args.projectId}\ncwd: ${entry.cwd || '(none)'}\nlocalPath: ${resolveLocalPath(config, args.key, entry)}\ncontext: ${path.relative(__dirname, ctxPath)}` }] };
+        return { content: [{ type: 'text', text: `Registered "${args.key}" → ${args.projectId}\ncwd: ${entry.cwd || '(none)'}\nlocalPath: ${resolveLocalPath(config, args.key, entry)}\ncontext: ${path.relative(DATA_HOME,ctxPath)}` }] };
       }
 
       case 'set_project_path': {
@@ -1310,7 +1407,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           body += '\n';
         }
         await writeFile(ctxPath, body, 'utf-8');
-        return { content: [{ type: 'text', text: `Wrote context for "${key}" → ${path.relative(__dirname, ctxPath)} (${mode})` }] };
+        return { content: [{ type: 'text', text: `Wrote context for "${key}" → ${path.relative(DATA_HOME,ctxPath)} (${mode})` }] };
       }
 
       case 'get_context': {
@@ -1519,10 +1616,46 @@ async function main() {
   console.error(`Overleaf MCP server v2 running on stdio (session cwd: ${SESSION_CWD})`);
 }
 
-// Only launch the stdio server when run directly, not when imported by tests.
+// `overleaf-mcp-server init`: scaffold the writable data home so a fresh install
+// has a projects.json to edit and an editable copy of the bundled templates.
+// Safe to re-run: never overwrites an existing config or template.
+async function runInit() {
+  await mkdir(DATA_HOME, { recursive: true });
+  await mkdir(CONTEXTS_DIR, { recursive: true });
+
+  if (existsSync(CONFIG_PATH)) {
+    console.log(`Config already present: ${CONFIG_PATH} (left untouched)`);
+  } else {
+    let body = '{\n  "settings": {},\n  "projects": {}\n}\n';
+    try { body = await readFile(path.join(PACKAGE_DIR, 'projects.example.json'), 'utf-8'); } catch {}
+    await writeFile(CONFIG_PATH, body, 'utf-8');
+    console.log(`Created ${CONFIG_PATH}`);
+  }
+
+  // Copy bundled templates the user hasn't already customised, so the scaffolds
+  // are editable in place under the data home.
+  const userTemplates = path.join(DATA_HOME, 'templates');
+  await mkdir(userTemplates, { recursive: true });
+  let bundled = [];
+  try { bundled = await readdir(BUNDLED_TEMPLATES_DIR); } catch {}
+  for (const name of bundled) {
+    const dest = path.join(userTemplates, name);
+    if (existsSync(dest)) continue;
+    try { await copyFile(path.join(BUNDLED_TEMPLATES_DIR, name), dest); console.log(`Copied template ${name}`); } catch {}
+  }
+
+  console.log(`\nData home: ${DATA_HOME}`);
+  console.log('Next: put your Overleaf git token and project id in projects.json,');
+  console.log('or skip the file and pass OVERLEAF_GIT_TOKEN + OVERLEAF_PROJECT_ID as env vars in your MCP client config.');
+}
+
+// Run directly (not imported by tests): dispatch the optional subcommand, else
+// start the stdio server.
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((error) => {
-    console.error('Fatal error:', error);
-    process.exit(1);
-  });
+  const onError = (error) => { console.error('Fatal error:', error); process.exit(1); };
+  if (process.argv[2] === 'init') {
+    runInit().catch(onError);
+  } else {
+    main().catch(onError);
+  }
 }

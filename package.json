@@ -1,12 +1,19 @@
 {
   "name": "overleaf-mcp-server",
-  "version": "2.6.1",
+  "version": "2.7.0",
   "description": "MCP server to read, edit, compile, and verify Overleaf/LaTeX projects over git: conflict-safe edits, figure upload, clean-build verification, citation and voice linting.",
   "type": "module",
   "main": "overleaf-mcp-server.js",
   "bin": {
-    "overleaf-mcp": "./overleaf-mcp-server.js"
+    "overleaf-mcp": "./overleaf-mcp-server.js",
+    "overleaf-mcp-server": "./overleaf-mcp-server.js"
   },
+  "files": [
+    "overleaf-mcp-server.js",
+    "templates/",
+    "writing-guidelines.md",
+    "projects.example.json"
+  ],
   "scripts": {
     "start": "node overleaf-mcp-server.js",
     "test": "node --test"
@@ -24,7 +31,7 @@
     "bibtex"
   ],
   "license": "MIT",
-  "author": "Tanishq Desai",
+  "author": "Aeva",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/nomanfoundhere/overleaf-mcp.git"
