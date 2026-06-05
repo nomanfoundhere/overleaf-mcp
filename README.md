@@ -90,6 +90,7 @@ Add `cleanAfterClone: true` (optionally `readUrl`) when the Overleaf project was
 | `get_section_content` | Pull a single section body by title. |
 | `edit_file` | Surgical anchored edit (oldString -> newString) + commit + push. Preferred over `write_file` for existing files: cheap, and conflict-safe — a missing anchor means the region changed on Overleaf, so it refuses instead of clobbering; non-overlapping concurrent edits auto-merge. |
 | `write_file` | Create a new file or overwrite one wholesale + push. Existing-file overwrite needs `baseSha` (from `read_file`) or `overwrite: true`; a stale `baseSha` is refused, never merged. Prefer `edit_file` for edits. |
+| `upload_file` | Upload binary file(s) (PNG/PDF figures) from a local disk path into the project + push. `write_file`/`edit_file` are text-only. Single (`srcPath`+`destPath`) or batch (`files: [{srcPath, destPath}]`, one commit). Existing files need `baseSha` (single) or `overwrite: true`. Path-confined to the repo. |
 | `compile_file` | Compile with `latexmk` from the repo root (LuaLaTeX default), so the project `.latexmkrc`, reruns, and bib processing all apply; reports errors, undefined refs, and overfull boxes. |
 | `status_summary` | High-level project status. |
 
@@ -99,7 +100,7 @@ When a tool is called without `projectName`, the server picks the project whose 
 
 ## Conflict safety
 
-Edits never silently overwrite a concurrent Overleaf change. `edit_file` pulls first (so non-overlapping browser edits are absorbed) and matches an exact anchor; a missing anchor means the targeted region changed, and the edit refuses. `write_file` overwriting an existing file must pass the `baseSha` from `read_file` (a stale one is refused) or `overwrite: true` to force. On the rare push-race, `edit_file` lets git 3-way-merge and refuses only on a real overlap.
+Edits never silently overwrite a concurrent Overleaf change. `edit_file` pulls first (so non-overlapping browser edits are absorbed) and matches an exact anchor; a missing anchor means the targeted region changed, and the edit refuses. `write_file` overwriting an existing file must pass the `baseSha` from `read_file` (a stale one is refused) or `overwrite: true` to force. On the rare push-race, `edit_file` lets git 3-way-merge and refuses only on a real overlap. Binary uploads (`upload_file`) use the same gate — new files create, existing files need `baseSha` (single mode) or `overwrite: true` — but never merge (a push race refuses and resets), and a `destPath` is always confined inside the project.
 
 ## Claude Desktop / Claude Code wiring
 
