@@ -54,8 +54,23 @@ function resolveLocalPath(config, projectKey, project) {
 //   3. project keyed "default"
 //   4. first project in file
 function pickProjectKey(config, requested) {
-  if (requested && config.projects[requested]) return requested;
+  // An explicit request must resolve to a known project. If it cannot, throw --
+  // never fall through to CWD autodetection, which is how writes used to land
+  // silently in the wrong project.
+  if (requested) {
+    if (config.projects[requested]) return requested;
+    const lc = String(requested).trim().toLowerCase();
+    for (const [key, p] of Object.entries(config.projects)) {
+      if (key.toLowerCase() === lc) return key;
+      if (p.name && p.name.toLowerCase() === lc) return key;
+    }
+    throw new Error(
+      `Project "${requested}" not found. Known keys: ${Object.keys(config.projects).join(', ') || '(none)'}. ` +
+      `Pass an exact key/name, or omit projectName to auto-detect from the current directory.`
+    );
+  }
 
+  // No explicit request: auto-detect from the session CWD (longest cwd prefix wins).
   if (SESSION_CWD) {
     let best = null;
     let bestLen = -1;
