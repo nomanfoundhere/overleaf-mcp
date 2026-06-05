@@ -1,6 +1,6 @@
 # Overleaf MCP Server
 
-> **Acknowledgement.** Forked from [mjyoo2/OverleafMCP](https://github.com/mjyoo2/OverleafMCP), the original Overleaf MCP server. This is an independent fork that adds an SSA bootstrap, per-project contexts, CWD autodetection, and a hardened git layer (no-shell `execFile`, credential-helper auth, `latexmk` compile, pull/recovery).
+> **Acknowledgement.** Forked from [mjyoo2/OverleafMCP](https://github.com/mjyoo2/OverleafMCP), the original Overleaf MCP server. This is an independent fork that adds a bootstrap for recurring structured documents, per-project contexts, CWD autodetection, and a hardened git layer (no-shell `execFile`, credential-helper auth, `latexmk` compile, pull/recovery).
 
 MCP server that exposes an Overleaf project to Claude via Overleaf's git integration. Read, write, push, and compile `.tex` from inside a Claude session.
 
@@ -11,7 +11,7 @@ OverleafMCP/
 ├── overleaf-mcp-server.js     # MCP server
 ├── projects.json              # config (gitignored)
 ├── projects.example.json
-├── writing-guidelines.md      # LaTeX + SSA rules, surfaced via get_context
+├── writing-guidelines.md      # LaTeX + writing rules, surfaced via get_context
 ├── contexts/                  # per-project context md, surfaced via get_context
 │   └── default.md
 ├── templates/
@@ -46,48 +46,39 @@ OverleafMCP/
 
 Project context (assignment-specific notes, terminology, deadlines) lives in `contexts/<key>.md`, **not** inside the JSON. Both `contexts/<key>.md` and `writing-guidelines.md` are re-read from disk on every `get_context` call — edit them mid-session, no restart needed.
 
-## One-shot SSA bootstrap
+## Adding a project
 
-The fastest path. Drop the Overleaf URL and the SSA name into chat:
-
-> Bootstrap `https://www.overleaf.com/project/abc123...` as `Y1 ABC123 SSA 5`.
-
-That triggers `bootstrap_ssa`, which:
-
-1. Parses the SSA name (`Y<year> <COURSE_CODE> SSA <num>`).
-2. Locates the course folder under `settings.academicRoot/Year <year>/Q*/<COURSE_CODE>*`. Folder convention: course code is the first whitespace-delimited token (e.g. `ABC123 - Course Title`).
-3. Creates `<course>/<settings.ssaSubdir>/<ssaName>/` (default subdir `MY SSAs`).
-4. Clones the Overleaf repo into `<workspace>/overleaf/`.
-5. Registers the project in `projects.json` (key = slug, e.g. `y1-4cbla30-ssa5`).
-6. Scaffolds `contexts/<slug>.md` with a question template.
-7. Returns a checklist of context questions for Claude to walk through with you, then writes the populated context via `update_context`.
-
-Add `cleanAfterClone: true` (and optionally `readUrl`) when the Overleaf project was just duplicated from a previous SSA — that runs `reset_ssa_content` against the fresh clone and pushes the wipe, so you start with the preamble intact and every chapter / appendix / bib entry / figure cleared.
-
-The canonical full main.tex (preamble + title block + Chapters input + ToC tcolorbox + bibliography + appendix) lives in `templates/main.tex`. If you want to seed a brand-new Overleaf project with it, read `templates/main.tex` and `write_file` to `main.tex` after bootstrap.
-
-`settings.academicRoot` and `settings.ssaSubdir` configure where SSAs land.
-
-## Adding a project without editing JSON (manual)
-
-For non-SSA projects:
+For any single Overleaf project, register it once — no JSON editing:
 
 > Register a new project: key `thesis`, Overleaf id `abcd1234efgh5678`, name "Thesis".
 
-That uses `register_project`, defaults `cwd` to the current session, and scaffolds `contexts/thesis.md`.
+That uses `register_project`, defaults `cwd` to the current session, and scaffolds `contexts/thesis.md`. To repoint an existing project's local clone, use `set_project_path` ("Set the local path for `thesis` to `/somewhere/else`"). From there all the general tools below work on it.
 
-To repoint an existing project's local clone:
+## Bootstrap for recurring structured documents
 
-> Set the local path for `ssa4` to `/somewhere/else`.
+`bootstrap_ssa` automates the repetitive setup for **recurring structured documents** — work where each new instance lives in a predictable folder and follows a naming convention, so onboarding it is otherwise the same clone/register/scaffold dance every time. The built-in convention targets SSAs (a recurring TU/e assignment), but the same shape fits any recurring structured Overleaf work: lab notes, weekly reports, meeting minutes, journal entries.
 
-That uses `set_project_path`.
+Drop the Overleaf URL and a name into chat:
+
+> Bootstrap `https://www.overleaf.com/project/abc123...` as `Y1 ABC123 SSA 5`.
+
+By the current (SSA) convention, `bootstrap_ssa`:
+
+1. Parses the name (`Y<year> <COURSE_CODE> SSA <num>`).
+2. Locates the parent folder under `settings.academicRoot/Year <year>/Q*/<COURSE_CODE>*` (the code is the first whitespace-delimited token of the folder name, e.g. `ABC123 - Course Title`).
+3. Creates `<parent>/<settings.ssaSubdir>/<name>/` (default subdir `MY SSAs`) and clones the Overleaf repo into `<workspace>/overleaf/`.
+4. Registers the project (key = slug, e.g. `y1-4cbla30-ssa5`), scaffolds `contexts/<slug>.md` with a question template, and returns a checklist for Claude to fill the context via `update_context`.
+
+Add `cleanAfterClone: true` (optionally `readUrl`) when the Overleaf project was duplicated from a previous instance: that runs `reset_ssa_content` against the fresh clone and pushes the wipe, so you start with the preamble intact and every chapter / appendix / bib entry / figure cleared. `templates/main.tex` holds a canonical full document you can seed a brand-new project with via `write_file`.
+
+> **Adapting the convention.** The name parsing and folder rules are specific to the SSA scheme. To drive other recurring work (say `Notes 2026-W23`), adjust `parseSsaName` / `findCourseFolder` and the `bootstrap_ssa` handler to your own naming and folder layout — or skip the bootstrap and just `register_project` each instance. `settings.academicRoot` and `settings.ssaSubdir` configure where the bootstrap places workspaces.
 
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `bootstrap_ssa` | One-shot: parse `Y<year> <COURSE> SSA <num>`, find the course folder, create the workspace, clone Overleaf, register, scaffold context. Pass `cleanAfterClone: true` when you've duplicated a previous SSA in the Overleaf UI and want the body wiped immediately. |
-| `reset_ssa_content` | Empty Chapters/ch*.tex, Chapters/app_*.tex, refs.bib, figures/* and optionally rewrite the title block in main.tex. Commits + pushes. Run after duplicating a previous SSA in Overleaf. Preamble is untouched. |
+| `bootstrap_ssa` | One-shot onboarding for a recurring structured document via the built-in naming/folder convention (currently SSAs): parse the name, find the parent folder, create the workspace, clone, register, scaffold context. `cleanAfterClone: true` wipes the body when the project was duplicated from a previous instance. See *Bootstrap for recurring structured documents*. |
+| `reset_ssa_content` | Empty Chapters/ch*.tex, Chapters/app_*.tex, refs.bib, figures/* and optionally rewrite the title block in main.tex; commit + push. For starting a duplicated structured doc from a clean slate. Preamble untouched. |
 | `get_context` | Read writing guidelines + active project context. Call at start of every writing session. |
 | `list_projects` | List configured projects, show which one autodetects from CWD. |
 | `register_project` | Add/overwrite a project entry. Defaults `cwd` to the current session. |
