@@ -57,6 +57,14 @@ Editing a LaTeX project through an AI normally means one of two bad options: pas
 
 `npx` fetches and runs the published package on demand. The token and project id are the entire setup for a single project, with no config file (this is **env-only mode**). `@latest` means each client restart picks up the newest published version automatically; pin `overleaf-forge@2.7.1` instead to freeze a version. For multiple projects, per-project contexts, or the SSA bootstrap, see [Configuration](#configuration).
 
+An MCP server is not an app you launch yourself: the client starts it as a subprocess, so "installing" it just means making its command available to the client. The `npx` form above needs no install step. If you would rather have a real command on your `PATH`, install it globally:
+
+```bash
+npm install -g overleaf-forge
+```
+
+and set `"command": "overleaf-forge"` with no `args` (keep the same `env` block). A global install does not auto-update: refresh it yourself with `npm update -g overleaf-forge`. `npx` is recommended precisely because it skips that step.
+
 To hack on the server instead, run it from source:
 
 ```bash
@@ -82,7 +90,7 @@ Restart the client (or reload its MCP servers) after editing, so it spawns the s
 
 ## Updating
 
-**As a user.** With `overleaf-forge@latest` in your config (the recommended form), restart the client or reload its MCP servers and it fetches the newest published version. If you pinned a version (`overleaf-forge@2.7.1`), change the number. If `npx` seems to keep running an old version, clear its cache with `npx clear-npx-cache` and restart.
+**As a user.** With `overleaf-forge@latest` in your config (the recommended form), restart the client or reload its MCP servers and it fetches the newest published version. If you pinned a version (`overleaf-forge@2.7.1`), change the number. If `npx` seems to keep running an old version, clear its cache with `npx clear-npx-cache` and restart. If you installed globally instead, update with `npm update -g overleaf-forge`.
 
 **As the maintainer (publishing a new release).** From the repository:
 
