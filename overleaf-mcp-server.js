@@ -6,9 +6,9 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { readFile, writeFile, access, mkdir, readdir, stat } from 'fs/promises';
+import { readFile, writeFile, access, mkdir, readdir, stat, rm, rename } from 'fs/promises';
 import { promisify } from 'util';
-import { exec as execCallback } from 'child_process';
+import { execFile as execFileCallback } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
@@ -16,7 +16,10 @@ import os from 'os';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const exec = promisify(execCallback);
+// Every subprocess call goes through execFile (no shell): no shell injection and
+// no secrets in command strings. Git auth is supplied via an inline credential
+// helper that reads the token from the environment (see OverleafGitClient._git).
+const execFile = promisify(execFileCallback);
 
 const CONFIG_PATH = path.join(__dirname, 'projects.json');
 const CONTEXTS_DIR = path.join(__dirname, 'contexts');
@@ -33,7 +36,11 @@ async function loadConfig() {
 }
 
 async function saveConfig(config) {
-  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  // Write-temp-then-rename so a crash mid-write can't corrupt projects.json
+  // (it holds the token and every project entry).
+  const tmp = `${CONFIG_PATH}.tmp`;
+  await writeFile(tmp, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  await rename(tmp, CONFIG_PATH);
 }
 
 function resolveGitToken(config, project) {
@@ -96,38 +103,74 @@ class OverleafGitClient {
     this.projectId = projectId;
     this.gitToken = gitToken;
     this.repoPath = localPath;
-    this.gitUrl = `https://git.overleaf.com/${projectId}`;
+    this.gitUrl = `https://git.overleaf.com/${projectId}`; // token-free; auth via credential helper
+  }
+
+  // Run git without a shell. For authenticated remote ops the token is provided
+  // through an inline credential helper that reads it from the environment, so
+  // the token never appears in argv and therefore never in an error message.
+  async _git(args, { auth = false } = {}) {
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+    const pre = [];
+    if (auth) {
+      if (!this.gitToken) {
+        throw new Error('No Overleaf git token configured. Set settings.gitToken in projects.json or OVERLEAF_GIT_TOKEN env var.');
+      }
+      env.OVERLEAF_TOKEN = this.gitToken;
+      pre.push(
+        '-c', 'credential.helper=',
+        '-c', 'credential.helper=!f() { test "$1" = get && echo username=git && echo "password=$OVERLEAF_TOKEN"; }; f'
+      );
+    }
+    return execFile('git', [...pre, ...args], { env, maxBuffer: 20 * 1024 * 1024 });
+  }
+
+  async _hasRepo() {
+    try { await access(path.join(this.repoPath, '.git')); return true; } catch { return false; }
   }
 
   async cloneOrPull() {
     if (!this.gitToken) {
       throw new Error('No Overleaf git token configured. Set settings.gitToken in projects.json or OVERLEAF_GIT_TOKEN env var.');
     }
+    if (!(await this._hasRepo())) {
+      await mkdir(path.dirname(this.repoPath), { recursive: true });
+      const { stdout } = await this._git(['clone', this.gitUrl, this.repoPath], { auth: true });
+      return stdout;
+    }
+    // Repair older clones that embedded the token in the remote URL.
+    await this._git(['-C', this.repoPath, 'remote', 'set-url', 'origin', this.gitUrl]).catch(() => {});
     try {
-      await exec(`test -d "${this.repoPath}/.git"`);
-      // Refresh remote URL so rotated tokens are picked up
-      await exec(`cd "${this.repoPath}" && git remote set-url origin https://git:${this.gitToken}@git.overleaf.com/${this.projectId}`);
-      const { stdout } = await exec(`cd "${this.repoPath}" && git pull`);
+      const { stdout } = await this._git(['-C', this.repoPath, 'pull', '--ff-only'], { auth: true });
       return stdout;
     } catch {
-      // Ensure parent dir exists before clone
-      await mkdir(path.dirname(this.repoPath), { recursive: true });
-      const { stdout } = await exec(
-        `git clone https://git:${this.gitToken}@git.overleaf.com/${this.projectId} "${this.repoPath}"`
-      );
-      return stdout;
+      // Pull failed (diverged, or leftover changes from a prior failed write).
+      // Overleaf is the source of truth, so fetch and hard-reset to the remote
+      // tip rather than cascading into a clone-into-nonempty-dir error.
+      await this._git(['-C', this.repoPath, 'fetch', 'origin'], { auth: true });
+      const { stdout: br } = await this._git(['-C', this.repoPath, 'rev-parse', '--abbrev-ref', 'HEAD']);
+      const branch = (br || '').trim() || 'master';
+      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]);
+      return `recovered: hard-reset to origin/${branch}`;
     }
   }
 
   async listFiles(extension = '.tex') {
     await this.cloneOrPull();
-    const { stdout } = await exec(
-      `find "${this.repoPath}" -name "*${extension}" -type f -not -path "*/\\.git/*"`
-    );
-    return stdout
-      .split('\n')
-      .filter(f => f)
-      .map(f => f.replace(this.repoPath + '/', ''));
+    const out = [];
+    const walk = async (dir) => {
+      const entries = await readdir(dir, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.name === '.git') continue;
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) await walk(full);
+        else if (e.isFile() && (!extension || e.name.endsWith(extension))) {
+          out.push(path.relative(this.repoPath, full));
+        }
+      }
+    };
+    await walk(this.repoPath);
+    return out.sort();
   }
 
   async readFile(filePath) {
@@ -139,40 +182,65 @@ class OverleafGitClient {
   async getSections(filePath) {
     const content = await this.readFile(filePath);
     const sections = [];
-    const sectionRegex = /\\(?:section|subsection|subsubsection)\{([^}]+)\}/g;
+    // Allow \section* and one level of nested braces in the title
+    // (e.g. \section{The \textbf{bold} title}).
+    const sectionRegex = /\\(section|subsection|subsubsection)\*?\{((?:[^{}]|\{[^{}]*\})*)\}/g;
     let match;
     while ((match = sectionRegex.exec(content)) !== null) {
-      sections.push({
-        title: match[1],
-        type: match[0].split('{')[0].replace('\\', ''),
-        index: match.index,
-      });
+      sections.push({ title: match[2], type: match[1], index: match.index });
     }
     return sections;
   }
 
   async compileFile(filePath, engine = 'lualatex') {
     await this.cloneOrPull();
-    const validEngines = ['pdflatex', 'xelatex', 'lualatex'];
-    if (!validEngines.includes(engine)) {
-      throw new Error(`Invalid engine "${engine}". Choose from: ${validEngines.join(', ')}`);
+    const engineFlag = { pdflatex: '-pdf', xelatex: '-xelatex', lualatex: '-lualatex' }[engine];
+    if (!engineFlag) {
+      throw new Error(`Invalid engine "${engine}". Choose from: pdflatex, xelatex, lualatex`);
     }
-    const enginePath = `/Library/TeX/texbin/${engine}`;
-    const fullPath = path.join(this.repoPath, filePath);
-    const dir = path.dirname(fullPath);
-    const { stdout, stderr } = await exec(
-      `cd "${dir}" && ${enginePath} -interaction=nonstopmode -output-directory="${dir}" "${fullPath}"`,
-      { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }
+    // Build with latexmk from the repo root so the project's .latexmkrc (shell-
+    // escape, the python@3.13 PATH fix for minted, $pdf_mode) applies, and so
+    // references, citations and reruns resolve -- a single raw engine pass cannot.
+    const texbin = '/Library/TeX/texbin';
+    const env = { ...process.env, PATH: `${texbin}:${process.env.PATH || ''}` };
+    const { stdout, stderr } = await execFile(
+      path.join(texbin, 'latexmk'),
+      [engineFlag, '-interaction=nonstopmode', '-halt-on-error', filePath],
+      { cwd: this.repoPath, timeout: 180000, maxBuffer: 20 * 1024 * 1024, env }
     ).catch(e => ({ stdout: e.stdout || '', stderr: e.stderr || e.message }));
 
-    const pdfPath = fullPath.replace(/\.tex$/, '.pdf');
+    const pdfPath = path.join(this.repoPath, filePath.replace(/\.tex$/, '.pdf'));
     let pdfExists = false;
-    try {
-      await exec(`test -f "${pdfPath}"`);
-      pdfExists = true;
-    } catch { /* no pdf */ }
+    try { await access(pdfPath); pdfExists = true; } catch { /* no pdf */ }
 
-    return { pdfPath: pdfExists ? pdfPath : null, stdout, stderr };
+    const log = `${stdout}\n${stderr}`;
+    const errors = (log.match(/^!.*$/gm) || []).slice(0, 20);
+    const undefinedRefs = (log.match(/^(?:LaTeX|Package)[^\n]*Warning:[^\n]*(?:undefined|multiply)[^\n]*/gmi) || []);
+    const overfull = (log.match(/^(?:Overfull|Underfull)[^\n]*$/gm) || []).slice(0, 20);
+    return {
+      pdfPath: pdfExists ? pdfPath : null,
+      errors,
+      undefinedRefs,
+      overfull,
+      tail: log.slice(-2500),
+    };
+  }
+
+  async commitAndPush(message, { addAll = false, addPath } = {}) {
+    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
+    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
+    if (addAll) await this._git(['-C', this.repoPath, 'add', '-A']);
+    else if (addPath) await this._git(['-C', this.repoPath, 'add', '--', addPath]);
+    try {
+      await this._git(['-C', this.repoPath, 'commit', '-m', message]);
+    } catch (e) {
+      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) {
+        return { pushed: false, reason: 'nothing to commit' };
+      }
+      throw e;
+    }
+    await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
+    return { pushed: true };
   }
 
   async writeFile(filePath, content, commitMessage = 'Update via Claude') {
@@ -180,33 +248,22 @@ class OverleafGitClient {
     const fullPath = path.join(this.repoPath, filePath);
     await mkdir(path.dirname(fullPath), { recursive: true });
     await writeFile(fullPath, content, 'utf-8');
-
-    await exec(`cd "${this.repoPath}" && git config user.email "claude@anthropic.com" && git config user.name "Claude"`);
-    await exec(`cd "${this.repoPath}" && git add "${filePath}"`);
-    // Allow empty commit to be a no-op silently
-    try {
-      await exec(`cd "${this.repoPath}" && git commit -m "${commitMessage.replace(/"/g, '\\"')}"`);
-    } catch (e) {
-      if (!/nothing to commit/i.test(e.stdout + e.stderr)) throw e;
-      return { pushed: false, reason: 'nothing to commit' };
-    }
-    await exec(
-      `cd "${this.repoPath}" && git push https://git:${this.gitToken}@git.overleaf.com/${this.projectId} HEAD`
-    );
-    return { pushed: true };
+    return await this.commitAndPush(commitMessage, { addPath: filePath });
   }
 
   async getSectionContent(filePath, sectionTitle) {
     const content = await this.readFile(filePath);
     const sections = await this.getSections(filePath);
-    const targetSection = sections.find(s => s.title === sectionTitle);
-    if (!targetSection) {
+    const target = sections.find(s => s.title === sectionTitle);
+    if (!target) {
       throw new Error(`Section "${sectionTitle}" not found`);
     }
-    const nextSection = sections.find(s => s.index > targetSection.index);
-    const startIdx = targetSection.index;
-    const endIdx = nextSection ? nextSection.index : content.length;
-    return content.substring(startIdx, endIdx);
+    // The body runs until the next heading of the SAME or HIGHER level, so a
+    // \section keeps its \subsections instead of being cut at the first one.
+    const rank = { section: 1, subsection: 2, subsubsection: 3 };
+    const next = sections.find(s => s.index > target.index && rank[s.type] <= rank[target.type]);
+    const endIdx = next ? next.index : content.length;
+    return content.substring(target.index, endIdx);
   }
 }
 
@@ -311,10 +368,10 @@ async function resetSsaContent(repoPath, { ssaName, author, date, readUrl, dryRu
     let s;
     try { s = await stat(p); } catch { continue; }
     if (s.isFile()) {
-      if (!dryRun) await exec(`rm "${p}"`);
+      if (!dryRun) await rm(p, { force: true });
       changed.push(`figures/${f} (removed)`);
     } else if (s.isDirectory()) {
-      if (!dryRun) await exec(`rm -rf "${p}"`);
+      if (!dryRun) await rm(p, { recursive: true, force: true });
       changed.push(`figures/${f}/ (removed)`);
     }
   }
@@ -610,15 +667,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               readUrl: args.readUrl,
             });
             // Stage + commit + push the wipe so Overleaf reflects it.
-            await exec(`cd "${cloneDir}" && git config user.email "claude@anthropic.com" && git config user.name "Claude"`);
-            await exec(`cd "${cloneDir}" && git add -A`);
             try {
-              await exec(`cd "${cloneDir}" && git commit -m "Reset content for ${args.ssaName.trim()}"`);
-              await exec(`cd "${cloneDir}" && git push https://git:${gitToken}@git.overleaf.com/${projectId} HEAD`);
-              cleanReport = reset;
+              const r = await client.commitAndPush(`Reset content for ${args.ssaName.trim()}`, { addAll: true });
+              cleanReport = r.pushed ? reset : { ...reset, note: 'nothing to commit' };
             } catch (e) {
-              if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) cleanReport = { ...reset, note: 'nothing to commit' };
-              else cleanReport = { ...reset, note: `commit/push failed: ${e.message}` };
+              cleanReport = { ...reset, note: `commit/push failed: ${e.message}` };
             }
           }
         } catch (e) {
@@ -717,15 +770,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
         let pushNote = '';
         if (!args.dryRun) {
-          await exec(`cd "${client.repoPath}" && git config user.email "claude@anthropic.com" && git config user.name "Claude"`);
-          await exec(`cd "${client.repoPath}" && git add -A`);
           try {
-            await exec(`cd "${client.repoPath}" && git commit -m "Reset SSA content"`);
-            await exec(`cd "${client.repoPath}" && git push https://git:${client.gitToken}@git.overleaf.com/${client.projectId} HEAD`);
-            pushNote = '✓ Pushed to Overleaf.';
+            const r = await client.commitAndPush('Reset SSA content', { addAll: true });
+            pushNote = r.pushed ? '✓ Pushed to Overleaf.' : '(nothing to commit — already clean)';
           } catch (e) {
-            if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) pushNote = '(nothing to commit — already clean)';
-            else pushNote = `✗ commit/push failed: ${e.message}`;
+            pushNote = `✗ commit/push failed: ${e.message}`;
           }
         } else {
           pushNote = '(dryRun — nothing written or pushed)';
@@ -846,9 +895,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'compile_file': {
         const { client } = await getClient(args.projectName);
-        const result = await client.compileFile(args.filePath, args.engine || 'lualatex');
-        const status = result.pdfPath ? `✓ PDF written to ${result.pdfPath}` : '✗ Compilation failed — no PDF produced';
-        return { content: [{ type: 'text', text: `${status}\n\n--- Output ---\n${result.stdout}\n${result.stderr ? `\n--- Errors ---\n${result.stderr}` : ''}`.trim() }] };
+        const r = await client.compileFile(args.filePath, args.engine || 'lualatex');
+        const status = r.pdfPath ? `✓ PDF written to ${r.pdfPath}` : '✗ Compilation failed — no PDF produced';
+        const parts = [status];
+        if (r.errors.length)        parts.push(`\n--- Errors (${r.errors.length}) ---\n${r.errors.join('\n')}`);
+        if (r.undefinedRefs.length) parts.push(`\n--- Undefined refs/citations (${r.undefinedRefs.length}) ---\n${r.undefinedRefs.join('\n')}`);
+        if (r.overfull.length)      parts.push(`\n--- Overfull/Underfull (${r.overfull.length}) ---\n${r.overfull.join('\n')}`);
+        parts.push(`\n--- Log tail ---\n${r.tail}`);
+        return { content: [{ type: 'text', text: parts.join('\n').trim() }] };
       }
 
       case 'write_file': {
@@ -885,8 +939,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error) {
+    // Defense in depth: scrub any tokenized URL that might surface in an error.
+    const msg = String(error?.message ?? error).replace(/git:[^@\s/]+@/g, 'git:***@');
     return {
-      content: [{ type: 'text', text: `Error: ${error.message}` }],
+      content: [{ type: 'text', text: `Error: ${msg}` }],
       isError: true,
     };
   }
