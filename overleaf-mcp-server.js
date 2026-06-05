@@ -927,7 +927,7 @@ async function readContext(projectKey, project) {
 
 // MCP server
 const server = new Server(
-  { name: 'overleaf-mcp-server', version: '2.7.1' },
+  { name: 'overleaf-forge', version: '2.7.1' },
   { capabilities: { tools: {} } }
 );
 
@@ -1613,10 +1613,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`Overleaf MCP server v2 running on stdio (session cwd: ${SESSION_CWD})`);
+  console.error(`overleaf-forge running on stdio (session cwd: ${SESSION_CWD})`);
 }
 
-// `overleaf-mcp-server init`: scaffold the writable data home so a fresh install
+// `overleaf-forge init`: scaffold the writable data home so a fresh install
 // has a projects.json to edit and an editable copy of the bundled templates.
 // Safe to re-run: never overwrites an existing config or template.
 async function runInit() {

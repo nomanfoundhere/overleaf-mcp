@@ -1,6 +1,6 @@
-# Overleaf MCP Server
+# overleaf-forge
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license) ![Node](https://img.shields.io/badge/node-%E2%89%A518-43853d.svg)
+[![npm](https://img.shields.io/npm/v/overleaf-forge.svg)](https://www.npmjs.com/package/overleaf-forge) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license) ![Node](https://img.shields.io/badge/node-%E2%89%A518-43853d.svg)
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant (Claude Code, Claude Desktop, or any MCP client) read, edit, compile, and verify an [Overleaf](https://www.overleaf.com) project over Overleaf's built-in **git** integration. The model edits a local clone with surgical, conflict-safe operations and pushes to Overleaf; nothing depends on scraping the web UI.
 
@@ -40,7 +40,7 @@ For most clients the whole install is a few lines of JSON: point the client at t
   "mcpServers": {
     "overleaf": {
       "command": "npx",
-      "args": ["-y", "overleaf-mcp-server"],
+      "args": ["-y", "overleaf-forge"],
       "env": {
         "OVERLEAF_GIT_TOKEN": "olp_xxxxxxxxxxxxxxxxxxxxxxxx",
         "OVERLEAF_PROJECT_ID": "0123456789abcdef01234567"
@@ -97,7 +97,7 @@ Set `OVERLEAF_GIT_TOKEN` and `OVERLEAF_PROJECT_ID` in the client's `env` block (
 For more than one project, per-project contexts, or the SSA bootstrap, use a `projects.json`. Scaffold it:
 
 ```bash
-npx overleaf-mcp-server init
+npx overleaf-forge init
 ```
 
 That creates `~/.overleaf-mcp/projects.json` from the example and copies the editable templates into `~/.overleaf-mcp/templates/`. Then fill in the config:
@@ -145,22 +145,22 @@ Assignment-specific notes (terminology, deadlines, structure constraints, pinned
 
 ### Customising the templates
 
-The SSA bootstrap scaffolds from two templates: `main.tex` (the document skeleton) and `context-scaffold.md` (the project-questions checklist). Defaults ship with the package. To change them, run `npx overleaf-mcp-server init` (which copies both into `~/.overleaf-mcp/templates/`) and edit them in place, or point `settings.templatesDir` / `OVERLEAF_MCP_TEMPLATES` at your own directory. The tokens `__SSA_NAME__`, `__SSA_TITLE__`, `__SSA_DATE__`, and `__OVERLEAF_READ_URL__` are substituted at scaffold time. A missing template falls back to the built-in default, so a partial templates directory never breaks the bootstrap.
+The SSA bootstrap scaffolds from two templates: `main.tex` (the document skeleton) and `context-scaffold.md` (the project-questions checklist). Defaults ship with the package. To change them, run `npx overleaf-forge init` (which copies both into `~/.overleaf-mcp/templates/`) and edit them in place, or point `settings.templatesDir` / `OVERLEAF_MCP_TEMPLATES` at your own directory. The tokens `__SSA_NAME__`, `__SSA_TITLE__`, `__SSA_DATE__`, and `__OVERLEAF_READ_URL__` are substituted at scaffold time. A missing template falls back to the built-in default, so a partial templates directory never breaks the bootstrap.
 
 ## Install via an AI agent
 
 Hand this to an agent (Claude Code, Cursor, etc.) to set up the server in the current client:
 
 ```text
-Install the Overleaf MCP server (npm package: overleaf-mcp-server).
+Install the Overleaf MCP server (npm package: overleaf-forge).
 1. Find this client's MCP config file (Claude Code ~/.claude.json, Claude Desktop's
    claude_desktop_config.json, or LM Studio ~/.lmstudio/mcp.json).
 2. Add an "overleaf" entry under mcpServers:
-     command: "npx", args: ["-y", "overleaf-mcp-server"]
+     command: "npx", args: ["-y", "overleaf-forge"]
    with an env block containing OVERLEAF_GIT_TOKEN and OVERLEAF_PROJECT_ID.
 3. Ask me for my Overleaf git token (Account Settings → Git Integration) and the
    project id from my project URL. Do not invent them.
-4. For multiple projects or the SSA bootstrap, run `npx overleaf-mcp-server init`
+4. For multiple projects or the SSA bootstrap, run `npx overleaf-forge init`
    and edit ~/.overleaf-mcp/projects.json instead of the env block.
 5. Tell me to restart or reload MCP servers in the client, then call status_summary
    to confirm it connected.
