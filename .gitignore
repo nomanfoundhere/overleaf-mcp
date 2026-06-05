@@ -6,3 +6,5 @@ docs/
 .env
 *.log
 .DS_Store
+*.tgz
+repos/

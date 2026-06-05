@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { readFile, writeFile, access, mkdir, readdir, stat, rm, rename, copyFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 import { promisify } from 'util';
 import { execFile as execFileCallback } from 'child_process';
 import path from 'path';
@@ -1649,9 +1649,20 @@ async function runInit() {
   console.log('or skip the file and pass OVERLEAF_GIT_TOKEN + OVERLEAF_PROJECT_ID as env vars in your MCP client config.');
 }
 
+// True when this file is the entry point. Both sides are realpath'd because npm
+// installs the bin as a symlink (how `npx` runs it): Node resolves import.meta.url
+// to the real target but leaves argv[1] as the symlink, so a raw string compare
+// would wrongly read as "imported" and never start the server.
+function isMainModule() {
+  try {
+    return Boolean(process.argv[1])
+      && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch { return false; }
+}
+
 // Run directly (not imported by tests): dispatch the optional subcommand, else
 // start the stdio server.
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule()) {
   const onError = (error) => { console.error('Fatal error:', error); process.exit(1); };
   if (process.argv[2] === 'init') {
     runInit().catch(onError);
