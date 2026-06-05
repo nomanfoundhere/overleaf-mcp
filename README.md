@@ -96,12 +96,12 @@ That uses `set_project_path`.
 | `get_sections` | List section titles in a `.tex`. |
 | `get_section_content` | Pull a single section body by title. |
 | `write_file` | Write + commit + push to Overleaf. Always follow with `compile_file`. |
-| `compile_file` | Compile locally (LuaLaTeX/XeLaTeX/pdfLaTeX). |
+| `compile_file` | Compile with `latexmk` from the repo root (LuaLaTeX default), so the project `.latexmkrc`, reruns, and bib processing all apply; reports errors, undefined refs, and overfull boxes. |
 | `status_summary` | High-level project status. |
 
 ## Project autodetect
 
-When a tool is called without `projectName`, the server picks the project whose `cwd` is the longest prefix of the current Claude session's working directory. Falls back to `projects.default`, then the first entry. To see which one resolves, call `list_projects` — the result tags the autodetected entry.
+When a tool is called without `projectName`, the server picks the project whose `cwd` is the longest prefix of the current Claude session's working directory. Falls back to `projects.default`, then the first entry. To see which one resolves, call `list_projects` — the result tags the autodetected entry. When `projectName` **is** supplied it must resolve to a known key or name; an unresolvable `projectName` raises an error rather than silently falling through to autodetection, so a write never lands in the wrong project.
 
 ## Claude Desktop / Claude Code wiring
 
@@ -124,7 +124,12 @@ When a tool is called without `projectName`, the server picks the project whose 
 ## Security
 
 - `projects.json` is gitignored — never commit a real token.
-- The git token is sent inline in the URL on every clone/pull/push. If you rotate the token, just update `settings.gitToken`; the server refreshes the remote URL on the next pull.
+- The git token is **never** placed in a command string or remote URL. Authenticated git operations (clone/pull/push) supply it through an inline credential helper that reads it from the environment, so it cannot leak into process listings or error output. The cloned `origin` URL is token-free, and any tokenized URL that might still surface in an error is redacted before it is returned. Rotate by updating `settings.gitToken`; it takes effect on the next call.
+- All subprocess calls use `execFile` (no shell), so file paths, commit messages, and section titles cannot inject shell commands.
+
+## Origin
+
+Forked from [mjyoo2/OverleafMCP](https://github.com/mjyoo2/OverleafMCP). This version (v2) adds the SSA bootstrap, per-project contexts, CWD autodetection, and hardens the git layer (no-shell `execFile`, credential-helper auth, `latexmk` compile, pull/recovery). Maintained independently; upstream is unmaintained.
 
 ## License
 
