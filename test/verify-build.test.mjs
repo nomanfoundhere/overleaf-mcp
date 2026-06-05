@@ -68,3 +68,14 @@ test('verifyBuild PASSes a trivial doc (integration; skipped without latexmk)', 
   assert.equal(v.pass, true);
   assert.ok(v.pageCount >= 1);
 });
+
+const REFDOC = '\\documentclass{article}\\begin{document}\\section{Intro}\\label{sec:intro}See \\ref{sec:intro} on page \\pageref{sec:intro}.\\end{document}\n';
+
+test('verifyBuild PASSes a doc with a cross-ref (final-pass log, not first-pass artifacts)', { skip: !existsSync(LATEXMK) }, async () => {
+  const r = await makeRemote({ 'main.tex': REFDOC });
+  after(() => r.cleanup());
+  const c = new OverleafGitClient('test', 'tok', clientClonePath(r.root), r.remote);
+  const v = await c.verifyBuild('main.tex', 'pdflatex');
+  assert.equal(v.pass, true, `expected PASS but undefinedRefs=${v.undefinedRefs.length}`);
+  assert.deepEqual(v.undefinedRefs, []);
+});

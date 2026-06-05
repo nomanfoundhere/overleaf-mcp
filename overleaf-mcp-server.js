@@ -255,8 +255,17 @@ class OverleafGitClient {
 
   // Clean-from-scratch build + structured PASS/FAIL verdict on the "done" bar.
   async verifyBuild(filePath, engine = 'lualatex') {
-    const { log, pdfPath } = await this._runLatexmk(filePath, engine, { clean: true });
-    const verdict = classifyBuildLog(log);
+    const { log: runLog, pdfPath } = await this._runLatexmk(filePath, engine, { clean: true });
+    // Classify the FINAL-pass log (e.g. main.log), NOT latexmk's concatenated
+    // multi-pass stdout: pass 1 (before the .aux exists) flags every \ref/\cite
+    // undefined, and those transient warnings would be false positives. main.log
+    // is the last engine run's output -- the true end state; a genuinely undefined
+    // ref persists there, a resolved one does not. Fall back to the run log if the
+    // .log file is missing (a catastrophic failure that produced no .log).
+    const logFile = path.join(this.repoPath, filePath.replace(/\.tex$/, '.log'));
+    let finalLog = runLog;
+    try { finalLog = await readFile(logFile, 'utf-8'); } catch { /* keep runLog */ }
+    const verdict = classifyBuildLog(finalLog);
     // Confirm the PDF against the real file, not just the log, so a parser miss
     // can't yield a false PASS; then recompute the verdict.
     verdict.pdfProduced = pdfPath !== null;
@@ -264,7 +273,7 @@ class OverleafGitClient {
       && verdict.errors.length === 0
       && verdict.undefinedRefs.length === 0
       && verdict.undefinedCitations.length === 0;
-    verdict.tail = log.slice(-2500);
+    verdict.tail = finalLog.slice(-2500);
     return verdict;
   }
 
@@ -653,7 +662,7 @@ async function readContext(projectKey, project) {
 
 // MCP server
 const server = new Server(
-  { name: 'overleaf-mcp-server', version: '2.4.0' },
+  { name: 'overleaf-mcp-server', version: '2.4.1' },
   { capabilities: { tools: {} } }
 );
 
