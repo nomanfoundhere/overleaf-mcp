@@ -98,6 +98,24 @@ function pickProjectKey(config, requested) {
   throw new Error('No projects configured');
 }
 
+// Pure: classify a latexmk/LaTeX log into a build verdict. Exported for tests.
+// pass iff a PDF was produced AND there are no errors, undefined references, or
+// undefined citations. Overfull/underfull boxes are reported but never fail.
+export function classifyBuildLog(log) {
+  const text = String(log || '');
+  const pageMatches = [...text.matchAll(/Output written on [^\n(]*\((\d+) pages?/g)];
+  const pageCount = pageMatches.length ? Number(pageMatches[pageMatches.length - 1][1]) : null;
+  const pdfProduced = pageCount !== null;
+  const undefinedRefs = text.match(/^LaTeX Warning: Reference [^\n]*undefined[^\n]*/gim) || [];
+  const undefinedCitations = text.match(/^(?:LaTeX|Package natbib|Package biblatex)[^\n]*Warning:[^\n]*Citation[^\n]*undefined[^\n]*/gim) || [];
+  const errors = (text.match(/^! [^\n]*/gm) || [])
+    .concat(text.match(/^(?:Latexmk|Fatal error)[^\n]*(?:error|failed|fatal)[^\n]*/gim) || []);
+  const overfullCount = (text.match(/^Overfull \\[hv]box/gm) || []).length;
+  const underfullCount = (text.match(/^Underfull \\[hv]box/gm) || []).length;
+  const pass = pdfProduced && errors.length === 0 && undefinedRefs.length === 0 && undefinedCitations.length === 0;
+  return { pass, pageCount, undefinedRefs, undefinedCitations, errors, overfullCount, underfullCount, pdfProduced };
+}
+
 class OverleafGitClient {
   constructor(projectId, gitToken, localPath, gitUrlOverride) {
     this.projectId = projectId;
