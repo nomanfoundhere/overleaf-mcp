@@ -90,6 +90,7 @@ Set `OVERLEAF_GIT_TOKEN` and `OVERLEAF_PROJECT_ID` in the client's `env` block (
 | `OVERLEAF_PROJECT_NAME` | Optional display name for the synthesized project. |
 | `OVERLEAF_MCP_HOME` | Optional. Override the data home (default `~/.overleaf-mcp`). |
 | `OVERLEAF_MCP_TEMPLATES` | Optional. Override the templates directory. |
+| `OVERLEAF_VOICE_LINTER` | Optional. Prose-linter command for `voice_lint` (alternative to `settings.voiceLinter`). |
 
 ### Config-file mode (multiple projects, contexts, bootstrap)
 
@@ -122,7 +123,7 @@ That creates `~/.overleaf-mcp/projects.json` from the example and copies the edi
 | `settings.gitToken` | Overleaf git token, used by every project (or set `OVERLEAF_GIT_TOKEN`). A per-project `gitToken` overrides it. |
 | `settings.repoDir` | Where project clones land by default (`repoDir/<name>`). A per-project `localPath` overrides it. |
 | `settings.templatesDir` | Optional. Directory of scaffold templates, overriding the bundled defaults. |
-| `settings.voiceLinter` | Optional. Command `voice_lint` runs on a file. |
+| `settings.voiceLinter` | Optional. A prose-linter command (or set `OVERLEAF_VOICE_LINTER`) that `voice_lint` runs on a file. No default. |
 | `projects.<key>.projectId` | The id from `https://www.overleaf.com/project/<ID>`. |
 | `projects.<key>.cwd` | Directory you launch the client from for this project; used to auto-detect the active project. |
 | `projects.<key>.localPath` | Explicit clone location (optional). |

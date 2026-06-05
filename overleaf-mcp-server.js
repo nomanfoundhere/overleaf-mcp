@@ -526,7 +526,7 @@ class OverleafGitClient {
   // tokenized (no shell); a leading ~ in any token expands to the home dir.
   async voiceLint(filePath, { command } = {}) {
     if (!command || !command.trim()) {
-      throw new Error('No voice linter configured (set settings.voiceLinter in projects.json).');
+      throw new Error('No voice linter configured. Set settings.voiceLinter in projects.json or the OVERLEAF_VOICE_LINTER env var (e.g. a command that takes a file path and exits non-zero on findings).');
     }
     await this.cloneOrPull();
     const abs = path.join(this.repoPath, filePath);
@@ -927,7 +927,7 @@ async function readContext(projectKey, project) {
 
 // MCP server
 const server = new Server(
-  { name: 'overleaf-mcp-server', version: '2.7.0' },
+  { name: 'overleaf-mcp-server', version: '2.7.1' },
   { capabilities: { tools: {} } }
 );
 
@@ -1188,7 +1188,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'voice_lint',
-      description: 'Lint a .tex file for the configured voice rules (settings.voiceLinter, default /path/to/your/voice_lint.py). Read-only and advisory — reports findings, never blocks. Run after editing SSA prose via edit_file/write_file, which bypass the local Edit/Write voice hooks.',
+      description: 'Lint a .tex file with a user-configured prose linter (settings.voiceLinter in projects.json, or the OVERLEAF_VOICE_LINTER env var; no default). The command receives the file path and should exit non-zero on findings. Read-only and advisory: reports output, never blocks. Useful after editing prose via edit_file/write_file, which bypass any local editor hooks.',
       inputSchema: {
         type: 'object',
         properties: { filePath: { type: 'string' }, projectName: { type: 'string' } },
@@ -1571,7 +1571,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'voice_lint': {
         const config = await loadConfig();
         const { client } = await getClient(args.projectName);
-        const command = config.settings?.voiceLinter || 'python3 /path/to/your/voice_lint.py';
+        const command = config.settings?.voiceLinter || process.env.OVERLEAF_VOICE_LINTER;
         const r = await client.voiceLint(args.filePath, { command });
         return { content: [{ type: 'text', text: r.clean ? `✓ voice OK — ${args.filePath}${r.findings ? `\n${r.findings}` : ''}` : `voice findings in ${args.filePath}:\n${r.findings}` }] };
       }

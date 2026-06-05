@@ -1,6 +1,6 @@
 {
   "name": "overleaf-mcp-server",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "description": "MCP server to read, edit, compile, and verify Overleaf/LaTeX projects over git: conflict-safe edits, figure upload, clean-build verification, citation and voice linting.",
   "type": "module",
   "main": "overleaf-mcp-server.js",
