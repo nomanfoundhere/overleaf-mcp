@@ -695,13 +695,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'edit_file',
+      description: 'Surgical, conflict-safe edit: replace oldString with newString in a file, then commit and push. PREFER this over write_file for edits to existing files — it is far cheaper than a full rewrite and it cannot silently clobber a concurrent Overleaf edit (a missing oldString means the region changed; the edit refuses). Non-overlapping concurrent edits auto-merge. oldString must match exactly once unless replaceAll is true. After editing, call compile_file to verify the build.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string' },
+          oldString: { type: 'string', description: 'Exact text to replace. Include enough surrounding context to be unique.' },
+          newString: { type: 'string', description: 'Replacement text.' },
+          replaceAll: { type: 'boolean', description: 'Replace every occurrence (default false; otherwise oldString must be unique).' },
+          commitMessage: { type: 'string' },
+          projectName: { type: 'string' },
+        },
+        required: ['filePath', 'oldString', 'newString'],
+      },
+    },
+    {
       name: 'write_file',
-      description: 'Write full file contents and push to Overleaf. After calling, ALWAYS call compile_file on the project entrypoint (usually main.tex) to verify the build still works. Do not declare a writing task complete without a successful compile.',
+      description: 'Create a new file, or overwrite an existing one wholesale, then push. For edits to existing files prefer edit_file. Overwriting an existing file requires either baseSha (from read_file, so a stale write is refused) or overwrite:true. After writing, call compile_file to verify the build.',
       inputSchema: {
         type: 'object',
         properties: {
           filePath: { type: 'string' },
           content: { type: 'string' },
+          baseSha: { type: 'string', description: 'The baseSha from read_file for this file. Required to overwrite an existing file safely; if Overleaf moved since, the write is refused.' },
+          overwrite: { type: 'boolean', description: 'Force-overwrite an existing file without a baseSha (deliberate full replacement). Ignored for new files.' },
           commitMessage: { type: 'string' },
           projectName: { type: 'string' },
         },
@@ -1021,12 +1039,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: parts.join('\n').trim() }] };
       }
 
+      case 'edit_file': {
+        const { client } = await getClient(args.projectName);
+        const res = await client.editFile(args.filePath, args.oldString, args.newString, args.replaceAll || false, args.commitMessage);
+        const tail = res.pushed
+          ? `Edited ${args.filePath}${res.merged ? ' (auto-merged a concurrent Overleaf change)' : ''}. NEXT STEP: call compile_file on the project main .tex to verify the build.`
+          : `No change applied to ${args.filePath} (${res.reason}).`;
+        return { content: [{ type: 'text', text: tail }] };
+      }
+
       case 'write_file': {
         const { client } = await getClient(args.projectName);
-        const res = await client.writeFile(args.filePath, args.content, args.commitMessage);
+        const res = await client.writeFile(args.filePath, args.content, {
+          baseSha: args.baseSha,
+          overwrite: args.overwrite,
+          commitMessage: args.commitMessage,
+        });
         const tail = res.pushed
-          ? `Pushed ${args.filePath}. NEXT STEP: call compile_file on the project main .tex to verify the build still works before declaring done.`
-          : `No changes detected for ${args.filePath} (${res.reason}).`;
+          ? `Wrote ${args.filePath}. NEXT STEP: call compile_file on the project main .tex to verify the build.`
+          : `No change detected for ${args.filePath} (${res.reason}).`;
         return { content: [{ type: 'text', text: tail }] };
       }
 
