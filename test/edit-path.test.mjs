@@ -144,3 +144,11 @@ test('writeFile overwrites without baseSha when overwrite:true', async () => {
   assert.equal(res.pushed, true);
   assert.equal(await c.readFile('main.tex'), 'forced\n');
 });
+
+test('editFile inserts replacement text literally (no $-substitution)', async () => {
+  const r = await makeRemote({ 'main.tex': 'see X here\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  await c.editFile('main.tex', 'X', '$$E=mc^2$$ & $&');
+  assert.equal(await c.readFile('main.tex'), 'see $$E=mc^2$$ & $& here\n');
+});

@@ -180,8 +180,8 @@ class OverleafGitClient {
   }
 
   // git blob SHA of a file at the current tip; null if the file isn't tracked.
-  async getBlobSha(filePath) {
-    await this.cloneOrPull();
+  async getBlobSha(filePath, { pull = true } = {}) {
+    if (pull) await this.cloneOrPull();
     try {
       const { stdout } = await this._git(['-C', this.repoPath, 'rev-parse', `HEAD:${filePath}`]);
       return stdout.trim();
@@ -278,7 +278,14 @@ class OverleafGitClient {
         e.cause = mergeErr;
         throw e;
       }
-      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
+      try {
+        await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
+      } catch (e2) {
+        await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
+        const e = new Error('conflict: Overleaf moved again while merging; reset clean — re-read the file and retry.');
+        e.cause = e2;
+        throw e;
+      }
       return { pushed: true, merged: true };
     }
   }
@@ -290,7 +297,7 @@ class OverleafGitClient {
     const { baseSha, overwrite = false, commitMessage } = opts;
     await this.cloneOrPull();
     const fullPath = path.join(this.repoPath, filePath);
-    const current = await this.getBlobSha(filePath); // null if new
+    const current = await this.getBlobSha(filePath, { pull: false }); // null if new
 
     if (current !== null) {
       if (baseSha != null) {
@@ -346,7 +353,7 @@ class OverleafGitClient {
     if (count > 1 && !replaceAll) {
       throw new Error(`oldString matches ${count} times in ${filePath}; pass replaceAll: true or include more surrounding context to make it unique.`);
     }
-    const updated = replaceAll ? parts.join(newString) : content.replace(oldString, newString);
+    const updated = replaceAll ? parts.join(newString) : content.replace(oldString, () => newString);
     await writeFile(fullPath, updated, 'utf-8');
 
     await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
@@ -1010,7 +1017,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'read_file': {
         const { client } = await getClient(args.projectName);
         const content = await client.readFile(args.filePath);
-        const baseSha = await client.getBlobSha(args.filePath);
+        const baseSha = await client.getBlobSha(args.filePath, { pull: false });
         const header = `<!-- overleaf-mcp baseSha: ${baseSha || 'none'} (pass as baseSha to write_file to guard against clobbering Overleaf edits) -->\n`;
         return { content: [{ type: 'text', text: header + content }] };
       }
