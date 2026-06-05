@@ -805,6 +805,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'verify_build',
+      description: 'Compile the entrypoint FROM SCRATCH (clean aux) and return a PASS/FAIL verdict on the done-bar: PASS only if a PDF is produced with zero LaTeX errors, zero undefined references, and zero undefined citations. Reports page count; overfull/underfull boxes are warnings, not failures. Use as the final gate before declaring a writing task done.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string', description: 'The entrypoint, usually main.tex.' },
+          engine: { type: 'string', description: 'pdflatex | xelatex | lualatex (default lualatex).' },
+          projectName: { type: 'string' },
+        },
+        required: ['filePath'],
+      },
+    },
+    {
       name: 'edit_file',
       description: 'Surgical, conflict-safe edit: replace oldString with newString in a file, then commit and push. PREFER this over write_file for edits to existing files — it is far cheaper than a full rewrite and it cannot silently clobber a concurrent Overleaf edit (a missing oldString means the region changed; the edit refuses). Non-overlapping concurrent edits auto-merge. oldString must match exactly once unless replaceAll is true. After editing, call compile_file to verify the build.',
       inputSchema: {
@@ -1167,6 +1180,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (r.overfull.length)      parts.push(`\n--- Overfull/Underfull (${r.overfull.length}) ---\n${r.overfull.join('\n')}`);
         parts.push(`\n--- Log tail ---\n${r.tail}`);
         return { content: [{ type: 'text', text: parts.join('\n').trim() }] };
+      }
+
+      case 'verify_build': {
+        const { client } = await getClient(args.projectName);
+        const v = await client.verifyBuild(args.filePath, args.engine || 'lualatex');
+        if (v.pass) {
+          const warn = (v.overfullCount || v.underfullCount)
+            ? ` (note: ${v.overfullCount} overfull / ${v.underfullCount} underfull boxes)` : '';
+          return { content: [{ type: 'text', text: `✓ PASS — ${v.pageCount} pages${warn}` }] };
+        }
+        const parts = ['✗ FAIL'];
+        if (!v.pdfProduced) parts.push('- no PDF produced');
+        if (v.errors.length) parts.push(`- ${v.errors.length} error(s):\n${v.errors.slice(0, 20).join('\n')}`);
+        if (v.undefinedRefs.length) parts.push(`- ${v.undefinedRefs.length} undefined reference(s):\n${v.undefinedRefs.slice(0, 20).join('\n')}`);
+        if (v.undefinedCitations.length) parts.push(`- ${v.undefinedCitations.length} undefined citation(s):\n${v.undefinedCitations.slice(0, 20).join('\n')}`);
+        if (v.overfullCount || v.underfullCount) parts.push(`- (warnings) ${v.overfullCount} overfull / ${v.underfullCount} underfull`);
+        parts.push(`\n--- log tail ---\n${v.tail}`);
+        return { content: [{ type: 'text', text: parts.join('\n') }] };
       }
 
       case 'edit_file': {

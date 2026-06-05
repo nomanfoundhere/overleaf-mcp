@@ -1,6 +1,8 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyBuildLog } from '../overleaf-mcp-server.js';
+import { existsSync } from 'node:fs';
+import { classifyBuildLog, OverleafGitClient } from '../overleaf-mcp-server.js';
+import { makeRemote, clientClonePath } from './helpers.mjs';
 
 const CLEAN = 'This is LuaHBTeX...\nOutput written on main.pdf (23 pages, 855513 bytes).\nLatexmk: All targets up to date\n';
 
@@ -53,4 +55,16 @@ test('a single failing class fails the whole verdict', () => {
   const v = classifyBuildLog(CLEAN + "LaTeX Warning: Reference `a' undefined on input line 1.\nUnderfull \\hbox (badness 10000) in paragraph at lines 3--4\n");
   assert.equal(v.pass, false);
   assert.equal(v.underfullCount, 1);
+});
+
+const LATEXMK = '/Library/TeX/texbin/latexmk';
+const TRIVIAL = '\\documentclass{article}\\begin{document}hello verify\\end{document}\n';
+
+test('verifyBuild PASSes a trivial doc (integration; skipped without latexmk)', { skip: !existsSync(LATEXMK) }, async () => {
+  const r = await makeRemote({ 'main.tex': TRIVIAL });
+  after(() => r.cleanup());
+  const c = new OverleafGitClient('test', 'tok', clientClonePath(r.root), r.remote);
+  const v = await c.verifyBuild('main.tex', 'pdflatex');
+  assert.equal(v.pass, true);
+  assert.ok(v.pageCount >= 1);
 });
