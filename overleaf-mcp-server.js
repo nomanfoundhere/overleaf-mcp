@@ -221,38 +221,51 @@ class OverleafGitClient {
     return sections;
   }
 
-  async compileFile(filePath, engine = 'lualatex') {
+  // Run latexmk from the repo root (so the project's .latexmkrc -- shell-escape,
+  // the python@3.13 PATH fix for minted, $pdf_mode -- applies, and refs/citations/
+  // reruns resolve). clean:true adds -gg to force a complete from-scratch rebuild.
+  async _runLatexmk(filePath, engine = 'lualatex', { clean = false } = {}) {
     await this.cloneOrPull();
     const engineFlag = { pdflatex: '-pdf', xelatex: '-xelatex', lualatex: '-lualatex' }[engine];
     if (!engineFlag) {
       throw new Error(`Invalid engine "${engine}". Choose from: pdflatex, xelatex, lualatex`);
     }
-    // Build with latexmk from the repo root so the project's .latexmkrc (shell-
-    // escape, the python@3.13 PATH fix for minted, $pdf_mode) applies, and so
-    // references, citations and reruns resolve -- a single raw engine pass cannot.
     const texbin = '/Library/TeX/texbin';
     const env = { ...process.env, PATH: `${texbin}:${process.env.PATH || ''}` };
+    const args = [engineFlag, '-interaction=nonstopmode', '-halt-on-error'];
+    if (clean) args.push('-gg');
+    args.push(filePath);
     const { stdout, stderr } = await execFile(
-      path.join(texbin, 'latexmk'),
-      [engineFlag, '-interaction=nonstopmode', '-halt-on-error', filePath],
+      path.join(texbin, 'latexmk'), args,
       { cwd: this.repoPath, timeout: 180000, maxBuffer: 20 * 1024 * 1024, env }
     ).catch(e => ({ stdout: e.stdout || '', stderr: e.stderr || e.message }));
-
     const pdfPath = path.join(this.repoPath, filePath.replace(/\.tex$/, '.pdf'));
     let pdfExists = false;
     try { await access(pdfPath); pdfExists = true; } catch { /* no pdf */ }
+    return { stdout, stderr, log: `${stdout}\n${stderr}`, pdfPath: pdfExists ? pdfPath : null };
+  }
 
-    const log = `${stdout}\n${stderr}`;
+  async compileFile(filePath, engine = 'lualatex') {
+    const { log, pdfPath } = await this._runLatexmk(filePath, engine, { clean: false });
     const errors = (log.match(/^!.*$/gm) || []).slice(0, 20);
     const undefinedRefs = (log.match(/^(?:LaTeX|Package)[^\n]*Warning:[^\n]*(?:undefined|multiply)[^\n]*/gmi) || []);
     const overfull = (log.match(/^(?:Overfull|Underfull)[^\n]*$/gm) || []).slice(0, 20);
-    return {
-      pdfPath: pdfExists ? pdfPath : null,
-      errors,
-      undefinedRefs,
-      overfull,
-      tail: log.slice(-2500),
-    };
+    return { pdfPath, errors, undefinedRefs, overfull, tail: log.slice(-2500) };
+  }
+
+  // Clean-from-scratch build + structured PASS/FAIL verdict on the "done" bar.
+  async verifyBuild(filePath, engine = 'lualatex') {
+    const { log, pdfPath } = await this._runLatexmk(filePath, engine, { clean: true });
+    const verdict = classifyBuildLog(log);
+    // Confirm the PDF against the real file, not just the log, so a parser miss
+    // can't yield a false PASS; then recompute the verdict.
+    verdict.pdfProduced = pdfPath !== null;
+    verdict.pass = verdict.pdfProduced
+      && verdict.errors.length === 0
+      && verdict.undefinedRefs.length === 0
+      && verdict.undefinedCitations.length === 0;
+    verdict.tail = log.slice(-2500);
+    return verdict;
   }
 
   async commitAndPush(message, { addAll = false, addPath } = {}) {
