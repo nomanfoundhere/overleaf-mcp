@@ -5,7 +5,7 @@
   "type": "module",
   "main": "overleaf-mcp-server.js",
   "bin": {
-    "overleaf-forge": "./overleaf-mcp-server.js"
+    "overleaf-forge": "overleaf-mcp-server.js"
   },
   "files": [
     "overleaf-mcp-server.js",
