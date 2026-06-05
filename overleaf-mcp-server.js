@@ -254,6 +254,35 @@ class OverleafGitClient {
     return { pushed: true };
   }
 
+  async _currentBranch() {
+    const { stdout } = await this._git(['-C', this.repoPath, 'rev-parse', '--abbrev-ref', 'HEAD']);
+    return (stdout || '').trim() || 'master';
+  }
+
+  // Push origin HEAD. If the remote moved during the op (non-fast-forward),
+  // let git 3-way merge it: clean merge -> push; real conflict -> abort, reset
+  // to the remote tip, and throw (so nothing half-applied is left behind).
+  async _pushWithMerge() {
+    try {
+      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
+      return { pushed: true, merged: false };
+    } catch {
+      const branch = await this._currentBranch();
+      await this._git(['-C', this.repoPath, 'fetch', 'origin'], { auth: true });
+      try {
+        await this._git(['-C', this.repoPath, 'merge', '--no-edit', `origin/${branch}`]);
+      } catch (mergeErr) {
+        await this._git(['-C', this.repoPath, 'merge', '--abort']).catch(() => {});
+        await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]);
+        const e = new Error('conflict: the file changed on Overleaf in a way that overlaps this edit. Re-read the file and retry.');
+        e.cause = mergeErr;
+        throw e;
+      }
+      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
+      return { pushed: true, merged: true };
+    }
+  }
+
   async writeFile(filePath, content, commitMessage = 'Update via Claude') {
     await this.cloneOrPull();
     const fullPath = path.join(this.repoPath, filePath);
