@@ -283,12 +283,49 @@ class OverleafGitClient {
     }
   }
 
-  async writeFile(filePath, content, commitMessage = 'Update via Claude') {
+  // Full-file create / wholesale overwrite. New files: created freely. Existing
+  // files: require either a matching baseSha (proves freshness) or overwrite:true
+  // (a deliberate clobber). A stale baseSha is refused, never merged.
+  async writeFile(filePath, content, opts = {}) {
+    const { baseSha, overwrite = false, commitMessage } = opts;
     await this.cloneOrPull();
     const fullPath = path.join(this.repoPath, filePath);
+    const current = await this.getBlobSha(filePath); // null if new
+
+    if (current !== null) {
+      if (baseSha != null) {
+        if (baseSha !== current) {
+          throw new Error(`${filePath} changed on Overleaf since baseSha ${String(baseSha).slice(0, 12)} (now ${current.slice(0, 12)}); the write is stale. Re-read and retry, or use edit_file for a surgical change.`);
+        }
+      } else if (!overwrite) {
+        throw new Error(`${filePath} already exists. Pass baseSha (from read_file) to overwrite the version you read, set overwrite:true to force, or use edit_file for a surgical change.`);
+      }
+    }
+
     await mkdir(path.dirname(fullPath), { recursive: true });
     await writeFile(fullPath, content, 'utf-8');
-    return await this.commitAndPush(commitMessage, { addPath: filePath });
+    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
+    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
+    await this._git(['-C', this.repoPath, 'add', '--', filePath]);
+    try {
+      await this._git(['-C', this.repoPath, 'commit', '-m', commitMessage || `Update ${filePath} via Claude`]);
+    } catch (e) {
+      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) {
+        return { pushed: false, reason: 'nothing to commit' };
+      }
+      throw e;
+    }
+    // write_file refuses on a push race rather than merging (conflict-refuse policy).
+    try {
+      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
+    } catch (e) {
+      const branch = await this._currentBranch();
+      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
+      await this._git(['-C', this.repoPath, 'fetch', 'origin'], { auth: true }).catch(() => {});
+      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
+      throw new Error(`${filePath}: Overleaf moved while writing; refused to overwrite. Re-read and retry. (${(e.stderr || e.message || '').slice(0, 120)})`);
+    }
+    return { pushed: true };
   }
 
   // Anchored, conflict-safe edit. Pulls first (absorbing non-overlapping Overleaf

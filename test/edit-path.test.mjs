@@ -99,3 +99,48 @@ test('editFile absorbs a non-overlapping concurrent edit (pull-first)', async ()
   await c.editFile('main.tex', 'bottom', 'BOTTOM');    // pull-first picks up TOP
   assert.equal(await c.readFile('main.tex'), 'TOP\nBOTTOM\n');
 });
+
+test('writeFile creates a new file freely', async () => {
+  const r = await makeRemote({ 'main.tex': 'm\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  const res = await c.writeFile('new.tex', 'fresh\n');
+  assert.equal(res.pushed, true);
+  assert.equal(await c.readFile('new.tex'), 'fresh\n');
+});
+
+test('writeFile overwrites an existing file when baseSha matches', async () => {
+  const r = await makeRemote({ 'main.tex': 'one\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  const base = await c.getBlobSha('main.tex');
+  const res = await c.writeFile('main.tex', 'two\n', { baseSha: base });
+  assert.equal(res.pushed, true);
+  assert.equal(await c.readFile('main.tex'), 'two\n');
+});
+
+test('writeFile refuses a stale baseSha (file changed on Overleaf)', async () => {
+  const r = await makeRemote({ 'main.tex': 'one\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  const stale = await c.getBlobSha('main.tex');
+  await r.remoteEdit('main.tex', 'edited-on-overleaf\n');
+  await assert.rejects(() => c.writeFile('main.tex', 'two\n', { baseSha: stale }), /changed on Overleaf|stale/i);
+  assert.equal(await c.readFile('main.tex'), 'edited-on-overleaf\n'); // untouched
+});
+
+test('writeFile refuses overwrite of an existing file without baseSha or overwrite', async () => {
+  const r = await makeRemote({ 'main.tex': 'one\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  await assert.rejects(() => c.writeFile('main.tex', 'two\n'), /overwrite|edit_file/i);
+});
+
+test('writeFile overwrites without baseSha when overwrite:true', async () => {
+  const r = await makeRemote({ 'main.tex': 'one\n' });
+  after(() => r.cleanup());
+  const c = client(r);
+  const res = await c.writeFile('main.tex', 'forced\n', { overwrite: true });
+  assert.equal(res.pushed, true);
+  assert.equal(await c.readFile('main.tex'), 'forced\n');
+});
