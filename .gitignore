@@ -1,5 +1,7 @@
 node_modules/
 temp/
 projects.json
+contexts/
 .env
 *.log
+.DS_Store
