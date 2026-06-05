@@ -88,13 +88,18 @@ Add `cleanAfterClone: true` (optionally `readUrl`) when the Overleaf project was
 | `read_file` | Read a file. |
 | `get_sections` | List section titles in a `.tex`. |
 | `get_section_content` | Pull a single section body by title. |
-| `write_file` | Write + commit + push to Overleaf. Always follow with `compile_file`. |
+| `edit_file` | Surgical anchored edit (oldString -> newString) + commit + push. Preferred over `write_file` for existing files: cheap, and conflict-safe — a missing anchor means the region changed on Overleaf, so it refuses instead of clobbering; non-overlapping concurrent edits auto-merge. |
+| `write_file` | Create a new file or overwrite one wholesale + push. Existing-file overwrite needs `baseSha` (from `read_file`) or `overwrite: true`; a stale `baseSha` is refused, never merged. Prefer `edit_file` for edits. |
 | `compile_file` | Compile with `latexmk` from the repo root (LuaLaTeX default), so the project `.latexmkrc`, reruns, and bib processing all apply; reports errors, undefined refs, and overfull boxes. |
 | `status_summary` | High-level project status. |
 
 ## Project autodetect
 
 When a tool is called without `projectName`, the server picks the project whose `cwd` is the longest prefix of the current Claude session's working directory. Falls back to `projects.default`, then the first entry. To see which one resolves, call `list_projects` — the result tags the autodetected entry. When `projectName` **is** supplied it must resolve to a known key or name; an unresolvable `projectName` raises an error rather than silently falling through to autodetection, so a write never lands in the wrong project.
+
+## Conflict safety
+
+Edits never silently overwrite a concurrent Overleaf change. `edit_file` pulls first (so non-overlapping browser edits are absorbed) and matches an exact anchor; a missing anchor means the targeted region changed, and the edit refuses. `write_file` overwriting an existing file must pass the `baseSha` from `read_file` (a stale one is refused) or `overwrite: true` to force. On the rare push-race, `edit_file` lets git 3-way-merge and refuses only on a real overlap.
 
 ## Claude Desktop / Claude Code wiring
 
