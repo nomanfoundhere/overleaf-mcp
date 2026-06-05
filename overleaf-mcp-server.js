@@ -6,7 +6,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { readFile, writeFile, access, mkdir, readdir, stat, rm, rename } from 'fs/promises';
+import { readFile, writeFile, access, mkdir, readdir, stat, rm, rename, copyFile } from 'fs/promises';
 import { promisify } from 'util';
 import { execFile as execFileCallback } from 'child_process';
 import path from 'path';
@@ -333,6 +333,78 @@ class OverleafGitClient {
       throw new Error(`${filePath}: Overleaf moved while writing; refused to overwrite. Re-read and retry. (${(e.stderr || e.message || '').slice(0, 120)})`);
     }
     return { pushed: true };
+  }
+
+  // Upload binary file(s) from local disk into the clone and push. Single mode:
+  // {srcPath, destPath}. Batch mode: {files:[{srcPath, destPath}, ...]} -> one
+  // commit for the set. The whole set is gated BEFORE any copy (all-or-nothing).
+  // Binary never 3-way-merges, so a push race refuses + resets like writeFile.
+  // baseSha freshness applies in single mode only; existing files in batch mode
+  // require overwrite:true.
+  async uploadFile({ srcPath, destPath, files, baseSha, overwrite = false, commitMessage } = {}) {
+    let pairs;
+    const batch = Array.isArray(files);
+    if (batch) {
+      if (srcPath || destPath) throw new Error('Pass either srcPath+destPath OR files[], not both.');
+      if (!files.length) throw new Error('files[] is empty.');
+      pairs = files.map(f => ({ src: f.srcPath, dest: f.destPath }));
+    } else if (srcPath && destPath) {
+      pairs = [{ src: srcPath, dest: destPath }];
+    } else {
+      throw new Error('upload_file needs srcPath+destPath (single) or files:[{srcPath,destPath}] (batch).');
+    }
+
+    await this.cloneOrPull();
+    const repoAbs = path.resolve(this.repoPath);
+    const resolved = [];
+    for (const { src, dest } of pairs) {
+      if (!src || !dest) throw new Error('each file needs srcPath and destPath.');
+      try { const s = await stat(src); if (!s.isFile()) throw new Error('not a file'); }
+      catch { throw new Error(`source file not found or unreadable: ${src}`); }
+      const destAbs = path.resolve(repoAbs, dest);
+      const rel = path.relative(repoAbs, destAbs);
+      if (destAbs === repoAbs || rel.startsWith('..') || path.isAbsolute(rel) || rel.split(path.sep)[0] === '.git') {
+        throw new Error(`destPath escapes the project or is not allowed: ${dest}`);
+      }
+      const current = await this.getBlobSha(rel, { pull: false });
+      if (current !== null) {
+        if (!batch && baseSha != null) {
+          if (baseSha !== current) {
+            throw new Error(`${rel} changed on Overleaf since baseSha ${String(baseSha).slice(0, 12)} (now ${current.slice(0, 12)}); stale. Re-read and retry.`);
+          }
+        } else if (!overwrite) {
+          throw new Error(`${rel} already exists. Pass baseSha (single mode) or overwrite:true to replace it.`);
+        }
+      }
+      resolved.push({ src, destAbs, rel });
+    }
+
+    for (const { src, destAbs } of resolved) {
+      await mkdir(path.dirname(destAbs), { recursive: true });
+      await copyFile(src, destAbs);
+    }
+
+    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
+    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
+    await this._git(['-C', this.repoPath, 'add', '--', ...resolved.map(r => r.rel)]);
+    try {
+      await this._git(['-C', this.repoPath, 'commit', '-m', commitMessage || `Upload ${resolved.length} file(s) via Claude`]);
+    } catch (e) {
+      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) {
+        return { pushed: false, reason: 'nothing to commit (identical to repo)', files: resolved.map(r => r.rel) };
+      }
+      throw e;
+    }
+    try {
+      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
+    } catch (e) {
+      const branch = await this._currentBranch();
+      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
+      await this._git(['-C', this.repoPath, 'fetch', 'origin'], { auth: true }).catch(() => {});
+      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
+      throw new Error(`Overleaf moved while uploading; refused. Re-read and retry. (${(e.stderr || e.message || '').slice(0, 120)})`);
+    }
+    return { pushed: true, files: resolved.map(r => r.rel) };
   }
 
   // Anchored, conflict-safe edit. Pulls first (absorbing non-overlapping Overleaf
