@@ -1,7 +1,7 @@
 {
   "name": "overleaf-mcp-server",
-  "version": "1.0.0",
-  "description": "MCP server for Overleaf integration",
+  "version": "2.1.0",
+  "description": "MCP server for Overleaf integration (SSA fork: bootstrap, contexts, autodetection, hardened git)",
   "type": "module",
   "main": "overleaf-mcp-server.js",
   "bin": {
