@@ -99,11 +99,11 @@ function pickProjectKey(config, requested) {
 }
 
 class OverleafGitClient {
-  constructor(projectId, gitToken, localPath) {
+  constructor(projectId, gitToken, localPath, gitUrlOverride) {
     this.projectId = projectId;
     this.gitToken = gitToken;
     this.repoPath = localPath;
-    this.gitUrl = `https://git.overleaf.com/${projectId}`; // token-free; auth via credential helper
+    this.gitUrl = gitUrlOverride || `https://git.overleaf.com/${projectId}`; // override for tests / token-free
   }
 
   // Run git without a shell. For authenticated remote ops the token is provided
@@ -266,6 +266,8 @@ class OverleafGitClient {
     return content.substring(target.index, endIdx);
   }
 }
+
+export { OverleafGitClient };
 
 async function getClient(projectName) {
   const config = await loadConfig();
@@ -954,7 +956,10 @@ async function main() {
   console.error(`Overleaf MCP server v2 running on stdio (session cwd: ${SESSION_CWD})`);
 }
 
-main().catch((error) => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+// Only launch the stdio server when run directly, not when imported by tests.
+if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => {
+    console.error('Fatal error:', error);
+    process.exit(1);
+  });
+}
