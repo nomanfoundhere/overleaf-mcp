@@ -1,167 +1,131 @@
 # Overleaf MCP Server
 
-An MCP (Model Context Protocol) server that provides access to Overleaf projects via Git integration. This allows Claude and other MCP clients to read LaTeX files, analyze document structure, and extract content from Overleaf projects.
+MCP server that exposes an Overleaf project to Claude via Overleaf's git integration. Read, write, push, and compile `.tex` from inside a Claude session.
 
-## Features
+## Layout
 
-- 📄 **File Management**: List and read files from Overleaf projects
-- 📋 **Document Structure**: Parse LaTeX sections and subsections
-- 🔍 **Content Extraction**: Extract specific sections by title
-- 📊 **Project Summary**: Get overview of project status and structure
-- 🏗️ **Multi-Project Support**: Manage multiple Overleaf projects
+```
+OverleafMCP/
+├── overleaf-mcp-server.js     # MCP server
+├── projects.json              # config (gitignored)
+├── projects.example.json
+├── writing-guidelines.md      # LaTeX + SSA rules, surfaced via get_context
+├── contexts/                  # per-project context md, surfaced via get_context
+│   └── default.md
+├── templates/
+│   └── main.tex               # canonical full document (preamble + title + Chapters + bib + appendix)
+├── package.json
+└── README.md
+```
 
-## Installation
+## Configuration
 
-1. Clone this repository
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
+`projects.json` shape:
 
-3. Set up your projects configuration:
-   ```bash
-   cp projects.example.json projects.json
-   ```
+```json
+{
+  "settings": {
+    "gitToken": "olp_...",
+    "repoDir": "/Users/you/PDFs/Overleaf GIT"
+  },
+  "projects": {
+    "default": {
+      "name": "My Paper",
+      "projectId": "OVERLEAF_PROJECT_ID",
+      "cwd": "/Users/you/path/where/claude/runs"
+    }
+  }
+}
+```
 
-4. Edit `projects.json` with your Overleaf credentials:
-   ```json
-   {
-     "projects": {
-       "default": {
-         "name": "My Paper",
-         "projectId": "YOUR_OVERLEAF_PROJECT_ID",
-         "gitToken": "YOUR_OVERLEAF_GIT_TOKEN"
-       }
-     }
-   }
-   ```
+- `settings.gitToken` — global token, used by all projects (per-project `gitToken` overrides). Alternatively set `OVERLEAF_GIT_TOKEN`.
+- `settings.repoDir` — where Overleaf clones land by default. Per-project `localPath` overrides.
+- `projects.<key>.cwd` — directory you launch Claude from for this project. Used for auto-detecting which project to talk to when no `projectName` is supplied.
 
-## Getting Overleaf Credentials
+Project context (assignment-specific notes, terminology, deadlines) lives in `contexts/<key>.md`, **not** inside the JSON. Both `contexts/<key>.md` and `writing-guidelines.md` are re-read from disk on every `get_context` call — edit them mid-session, no restart needed.
 
-1. **Git Token**: 
-   - Go to Overleaf Account Settings → Git Integration
-   - Click "Create Token"
+## One-shot SSA bootstrap
 
-2. **Project ID**: 
-   - Open your Overleaf project
-   - Find it in the URL: `https://www.overleaf.com/project/[PROJECT_ID]`
+The fastest path. Drop the Overleaf URL and the SSA name into chat:
 
-## Claude Desktop Setup
+> Bootstrap `https://www.overleaf.com/project/abc123...` as `Y1 ABC123 SSA 5`.
 
-Add to your Claude Desktop configuration file:
+That triggers `bootstrap_ssa`, which:
 
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Linux**: `~/.config/claude/claude_desktop_config.json`
+1. Parses the SSA name (`Y<year> <COURSE_CODE> SSA <num>`).
+2. Locates the course folder under `settings.academicRoot/Year <year>/Q*/<COURSE_CODE>*`. Folder convention: course code is the first whitespace-delimited token (e.g. `ABC123 - Course Title`).
+3. Creates `<course>/<settings.ssaSubdir>/<ssaName>/` (default subdir `MY SSAs`).
+4. Clones the Overleaf repo into `<workspace>/overleaf/`.
+5. Registers the project in `projects.json` (key = slug, e.g. `y1-4cbla30-ssa5`).
+6. Scaffolds `contexts/<slug>.md` with a question template.
+7. Returns a checklist of context questions for Claude to walk through with you, then writes the populated context via `update_context`.
+
+Add `cleanAfterClone: true` (and optionally `readUrl`) when the Overleaf project was just duplicated from a previous SSA — that runs `reset_ssa_content` against the fresh clone and pushes the wipe, so you start with the preamble intact and every chapter / appendix / bib entry / figure cleared.
+
+The canonical full main.tex (preamble + title block + Chapters input + ToC tcolorbox + bibliography + appendix) lives in `templates/main.tex`. If you want to seed a brand-new Overleaf project with it, read `templates/main.tex` and `write_file` to `main.tex` after bootstrap.
+
+`settings.academicRoot` and `settings.ssaSubdir` configure where SSAs land.
+
+## Adding a project without editing JSON (manual)
+
+For non-SSA projects:
+
+> Register a new project: key `thesis`, Overleaf id `abcd1234efgh5678`, name "Thesis".
+
+That uses `register_project`, defaults `cwd` to the current session, and scaffolds `contexts/thesis.md`.
+
+To repoint an existing project's local clone:
+
+> Set the local path for `ssa4` to `/somewhere/else`.
+
+That uses `set_project_path`.
+
+## Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `bootstrap_ssa` | One-shot: parse `Y<year> <COURSE> SSA <num>`, find the course folder, create the workspace, clone Overleaf, register, scaffold context. Pass `cleanAfterClone: true` when you've duplicated a previous SSA in the Overleaf UI and want the body wiped immediately. |
+| `reset_ssa_content` | Empty Chapters/ch*.tex, Chapters/app_*.tex, refs.bib, figures/* and optionally rewrite the title block in main.tex. Commits + pushes. Run after duplicating a previous SSA in Overleaf. Preamble is untouched. |
+| `get_context` | Read writing guidelines + active project context. Call at start of every writing session. |
+| `list_projects` | List configured projects, show which one autodetects from CWD. |
+| `register_project` | Add/overwrite a project entry. Defaults `cwd` to the current session. |
+| `set_project_path` | Update `localPath` and/or `cwd` for an existing project. |
+| `update_context` | Replace or append `contexts/<key>.md`. Takes effect immediately. |
+| `list_files` | List files in the Overleaf repo (filter by extension). |
+| `read_file` | Read a file. |
+| `get_sections` | List section titles in a `.tex`. |
+| `get_section_content` | Pull a single section body by title. |
+| `write_file` | Write + commit + push to Overleaf. Always follow with `compile_file`. |
+| `compile_file` | Compile locally (LuaLaTeX/XeLaTeX/pdfLaTeX). |
+| `status_summary` | High-level project status. |
+
+## Project autodetect
+
+When a tool is called without `projectName`, the server picks the project whose `cwd` is the longest prefix of the current Claude session's working directory. Falls back to `projects.default`, then the first entry. To see which one resolves, call `list_projects` — the result tags the autodetected entry.
+
+## Claude Desktop / Claude Code wiring
 
 ```json
 {
   "mcpServers": {
     "overleaf": {
-      "command": "node",
-      "args": [
-        "/path/to/OverleafMCP/overleaf-mcp-server.js"
-      ]
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/path/to/OverleafMCP/overleaf-mcp-server.js"]
     }
   }
 }
 ```
 
-Restart Claude Desktop after configuration.
+## Getting Overleaf credentials
 
-## Available Tools
+1. **Git token:** Overleaf → Account Settings → Git Integration → Create Token. Same token covers every project on that account, so it lives once in `settings.gitToken`.
+2. **Project ID:** the part of `https://www.overleaf.com/project/<ID>`.
 
-### `list_projects`
-List all configured projects.
+## Security
 
-### `list_files`
-List files in a project (default: .tex files).
-- `extension`: File extension filter (optional)
-- `projectName`: Project identifier (optional, defaults to "default")
-
-### `read_file`
-Read a specific file from the project.
-- `filePath`: Path to the file (required)
-- `projectName`: Project identifier (optional)
-
-### `get_sections`
-Get all sections from a LaTeX file.
-- `filePath`: Path to the LaTeX file (required)
-- `projectName`: Project identifier (optional)
-
-### `get_section_content`
-Get content of a specific section.
-- `filePath`: Path to the LaTeX file (required)
-- `sectionTitle`: Title of the section (required)
-- `projectName`: Project identifier (optional)
-
-### `status_summary`
-Get a comprehensive project status summary.
-- `projectName`: Project identifier (optional)
-
-## Usage Examples
-
-```
-# List all projects
-Use the list_projects tool
-
-# Get project overview
-Use status_summary tool
-
-# Read main.tex file
-Use read_file with filePath: "main.tex"
-
-# Get Introduction section
-Use get_section_content with filePath: "main.tex" and sectionTitle: "Introduction"
-
-# List all sections in a file
-Use get_sections with filePath: "main.tex"
-```
-
-## Multi-Project Usage
-
-To work with multiple projects, add them to `projects.json`:
-
-```json
-{
-  "projects": {
-    "default": {
-      "name": "Main Paper",
-      "projectId": "project-id-1",
-      "gitToken": "token-1"
-    },
-    "paper2": {
-      "name": "Second Paper", 
-      "projectId": "project-id-2",
-      "gitToken": "token-2"
-    }
-  }
-}
-```
-
-Then specify the project in tool calls:
-```
-Use get_section_content with projectName: "paper2", filePath: "main.tex", sectionTitle: "Methods"
-```
-
-## File Structure
-
-```
-OverleafMCP/
-├── overleaf-mcp-server.js    # Main MCP server
-├── overleaf-git-client.js    # Git client library
-├── projects.json             # Your project configuration (gitignored)
-├── projects.example.json     # Example configuration
-├── package.json              # Dependencies
-└── README.md                 # This file
-```
-
-## Security Notes
-
-- `projects.json` is gitignored to protect your credentials
-- Never commit real project IDs or Git tokens
-- Use the provided `projects.example.json` as a template
+- `projects.json` is gitignored — never commit a real token.
+- The git token is sent inline in the URL on every clone/pull/push. If you rotate the token, just update `settings.gitToken`; the server refreshes the remote URL on the next pull.
 
 ## License
 
-MIT License
+MIT.

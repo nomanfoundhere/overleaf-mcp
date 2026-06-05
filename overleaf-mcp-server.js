@@ -6,8 +6,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { spawn } from 'child_process';
-import { readFile } from 'fs/promises';
+import { readFile, writeFile, access, mkdir, readdir, stat } from 'fs/promises';
 import { promisify } from 'util';
 import { exec as execCallback } from 'child_process';
 import path from 'path';
@@ -19,38 +18,85 @@ const __dirname = path.dirname(__filename);
 
 const exec = promisify(execCallback);
 
-// Load projects configuration
-let projectsConfig;
-try {
-  const configPath = path.join(__dirname, 'projects.json');
-  const configData = await readFile(configPath, 'utf-8');
-  projectsConfig = JSON.parse(configData);
-} catch (error) {
-  console.error('Error loading projects.json:', error.message);
-  console.error('Please create projects.json from projects.example.json');
-  process.exit(1);
+const CONFIG_PATH = path.join(__dirname, 'projects.json');
+const CONTEXTS_DIR = path.join(__dirname, 'contexts');
+const GUIDELINES_PATH = path.join(__dirname, 'writing-guidelines.md');
+
+// Capture the cwd Claude Code spawned this MCP from. Used for project autodetection.
+const SESSION_CWD = process.cwd();
+
+// Re-read on every call so register_project / token rotation / context edits
+// take effect immediately without restarting Claude.
+async function loadConfig() {
+  const raw = await readFile(CONFIG_PATH, 'utf-8');
+  return JSON.parse(raw);
 }
 
-// Git operations helper
+async function saveConfig(config) {
+  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+}
+
+function resolveGitToken(config, project) {
+  return project.gitToken || config.settings?.gitToken || process.env.OVERLEAF_GIT_TOKEN;
+}
+
+function resolveLocalPath(config, projectKey, project) {
+  if (project.localPath) return project.localPath;
+  if (config.settings?.repoDir) {
+    return path.join(config.settings.repoDir, project.name || projectKey);
+  }
+  return path.join(os.tmpdir(), `overleaf-${project.projectId}`);
+}
+
+// Default project resolution:
+//   1. explicit projectName argument
+//   2. project whose `cwd` is a prefix of SESSION_CWD (longest match wins)
+//   3. project keyed "default"
+//   4. first project in file
+function pickProjectKey(config, requested) {
+  if (requested && config.projects[requested]) return requested;
+
+  if (SESSION_CWD) {
+    let best = null;
+    let bestLen = -1;
+    for (const [key, p] of Object.entries(config.projects)) {
+      if (p.cwd && (SESSION_CWD === p.cwd || SESSION_CWD.startsWith(p.cwd + path.sep))) {
+        if (p.cwd.length > bestLen) {
+          best = key;
+          bestLen = p.cwd.length;
+        }
+      }
+    }
+    if (best) return best;
+  }
+
+  if (config.projects.default) return 'default';
+  const keys = Object.keys(config.projects);
+  if (keys.length) return keys[0];
+  throw new Error('No projects configured');
+}
+
 class OverleafGitClient {
-  constructor(projectId, gitToken) {
+  constructor(projectId, gitToken, localPath) {
     this.projectId = projectId;
     this.gitToken = gitToken;
-    this.repoPath = path.join(os.tmpdir(), `overleaf-${projectId}`);
+    this.repoPath = localPath;
     this.gitUrl = `https://git.overleaf.com/${projectId}`;
   }
 
   async cloneOrPull() {
+    if (!this.gitToken) {
+      throw new Error('No Overleaf git token configured. Set settings.gitToken in projects.json or OVERLEAF_GIT_TOKEN env var.');
+    }
     try {
-      // Check if repo exists
       await exec(`test -d "${this.repoPath}/.git"`);
-      // Pull latest changes
-      const { stdout } = await exec(`cd "${this.repoPath}" && git pull`, {
-        env: { ...process.env, GIT_ASKPASS: 'echo', GIT_PASSWORD: this.gitToken }
-      });
+      // Refresh remote URL so rotated tokens are picked up
+      await exec(`cd "${this.repoPath}" && git remote set-url origin https://git:${this.gitToken}@git.overleaf.com/${this.projectId}`);
+      const { stdout } = await exec(`cd "${this.repoPath}" && git pull`);
       return stdout;
     } catch {
-      // Clone repo - Overleaf requires format: https://git:TOKEN@git.overleaf.com/PROJECT_ID
+      // Ensure parent dir exists before clone
+      await mkdir(path.dirname(this.repoPath), { recursive: true });
       const { stdout } = await exec(
         `git clone https://git:${this.gitToken}@git.overleaf.com/${this.projectId} "${this.repoPath}"`
       );
@@ -61,7 +107,7 @@ class OverleafGitClient {
   async listFiles(extension = '.tex') {
     await this.cloneOrPull();
     const { stdout } = await exec(
-      `find "${this.repoPath}" -name "*${extension}" -type f`
+      `find "${this.repoPath}" -name "*${extension}" -type f -not -path "*/\\.git/*"`
     );
     return stdout
       .split('\n')
@@ -80,257 +126,743 @@ class OverleafGitClient {
     const sections = [];
     const sectionRegex = /\\(?:section|subsection|subsubsection)\{([^}]+)\}/g;
     let match;
-    
     while ((match = sectionRegex.exec(content)) !== null) {
       sections.push({
         title: match[1],
         type: match[0].split('{')[0].replace('\\', ''),
-        index: match.index
+        index: match.index,
       });
     }
-    
     return sections;
+  }
+
+  async compileFile(filePath, engine = 'lualatex') {
+    await this.cloneOrPull();
+    const validEngines = ['pdflatex', 'xelatex', 'lualatex'];
+    if (!validEngines.includes(engine)) {
+      throw new Error(`Invalid engine "${engine}". Choose from: ${validEngines.join(', ')}`);
+    }
+    const enginePath = `/Library/TeX/texbin/${engine}`;
+    const fullPath = path.join(this.repoPath, filePath);
+    const dir = path.dirname(fullPath);
+    const { stdout, stderr } = await exec(
+      `cd "${dir}" && ${enginePath} -interaction=nonstopmode -output-directory="${dir}" "${fullPath}"`,
+      { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }
+    ).catch(e => ({ stdout: e.stdout || '', stderr: e.stderr || e.message }));
+
+    const pdfPath = fullPath.replace(/\.tex$/, '.pdf');
+    let pdfExists = false;
+    try {
+      await exec(`test -f "${pdfPath}"`);
+      pdfExists = true;
+    } catch { /* no pdf */ }
+
+    return { pdfPath: pdfExists ? pdfPath : null, stdout, stderr };
+  }
+
+  async writeFile(filePath, content, commitMessage = 'Update via Claude') {
+    await this.cloneOrPull();
+    const fullPath = path.join(this.repoPath, filePath);
+    await mkdir(path.dirname(fullPath), { recursive: true });
+    await writeFile(fullPath, content, 'utf-8');
+
+    await exec(`cd "${this.repoPath}" && git config user.email "claude@anthropic.com" && git config user.name "Claude"`);
+    await exec(`cd "${this.repoPath}" && git add "${filePath}"`);
+    // Allow empty commit to be a no-op silently
+    try {
+      await exec(`cd "${this.repoPath}" && git commit -m "${commitMessage.replace(/"/g, '\\"')}"`);
+    } catch (e) {
+      if (!/nothing to commit/i.test(e.stdout + e.stderr)) throw e;
+      return { pushed: false, reason: 'nothing to commit' };
+    }
+    await exec(
+      `cd "${this.repoPath}" && git push https://git:${this.gitToken}@git.overleaf.com/${this.projectId} HEAD`
+    );
+    return { pushed: true };
   }
 
   async getSectionContent(filePath, sectionTitle) {
     const content = await this.readFile(filePath);
     const sections = await this.getSections(filePath);
-    
     const targetSection = sections.find(s => s.title === sectionTitle);
     if (!targetSection) {
       throw new Error(`Section "${sectionTitle}" not found`);
     }
-    
     const nextSection = sections.find(s => s.index > targetSection.index);
     const startIdx = targetSection.index;
     const endIdx = nextSection ? nextSection.index : content.length;
-    
     return content.substring(startIdx, endIdx);
   }
 }
 
-// Create MCP server
-const server = new Server(
-  {
-    name: 'overleaf-mcp-server',
-    version: '1.0.0',
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
-
-// Helper to get project
-function getProject(projectName = 'default') {
-  const project = projectsConfig.projects[projectName];
-  if (!project) {
-    throw new Error(`Project "${projectName}" not found in configuration`);
-  }
-  return new OverleafGitClient(project.projectId, project.gitToken);
+async function getClient(projectName) {
+  const config = await loadConfig();
+  const key = pickProjectKey(config, projectName);
+  const project = config.projects[key];
+  const gitToken = resolveGitToken(config, project);
+  const localPath = resolveLocalPath(config, key, project);
+  return { client: new OverleafGitClient(project.projectId, gitToken, localPath), key, project };
 }
 
-// List all projects
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+// Parse an SSA name like "Y1 ABC123 SSA 5" → { year, courseCode, ssaNum, slug }.
+function parseSsaName(name) {
+  const m = name.trim().match(/^Y(\d+)\s+([A-Za-z0-9]+)\s+SSA\s*(\d+)$/i);
+  if (!m) {
+    throw new Error(`SSA name must look like "Y<year> <COURSE_CODE> SSA <num>" (got "${name}")`);
+  }
   return {
-    tools: [
-      {
-        name: 'list_projects',
-        description: 'List all configured Overleaf projects',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
-      },
-      {
-        name: 'list_files',
-        description: 'List files in an Overleaf project',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            projectName: {
-              type: 'string',
-              description: 'Project identifier (optional, defaults to "default")',
-            },
-            extension: {
-              type: 'string',
-              description: 'File extension filter (optional, e.g., ".tex")',
-            },
-          },
-        },
-      },
-      {
-        name: 'read_file',
-        description: 'Read a file from an Overleaf project',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            filePath: {
-              type: 'string',
-              description: 'Path to the file',
-            },
-            projectName: {
-              type: 'string',
-              description: 'Project identifier (optional)',
-            },
-          },
-          required: ['filePath'],
-        },
-      },
-      {
-        name: 'get_sections',
-        description: 'Get all sections from a LaTeX file',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            filePath: {
-              type: 'string',
-              description: 'Path to the LaTeX file',
-            },
-            projectName: {
-              type: 'string',
-              description: 'Project identifier (optional)',
-            },
-          },
-          required: ['filePath'],
-        },
-      },
-      {
-        name: 'get_section_content',
-        description: 'Get content of a specific section',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            filePath: {
-              type: 'string',
-              description: 'Path to the LaTeX file',
-            },
-            sectionTitle: {
-              type: 'string',
-              description: 'Title of the section',
-            },
-            projectName: {
-              type: 'string',
-              description: 'Project identifier (optional)',
-            },
-          },
-          required: ['filePath', 'sectionTitle'],
-        },
-      },
-      {
-        name: 'status_summary',
-        description: 'Get a comprehensive project status summary',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            projectName: {
-              type: 'string',
-              description: 'Project identifier (optional)',
-            },
-          },
-        },
-      },
-    ],
+    year: parseInt(m[1], 10),
+    courseCode: m[2].toUpperCase(),
+    ssaNum: parseInt(m[3], 10),
+    slug: `y${m[1]}-${m[2].toLowerCase()}-ssa${m[3]}`,
   };
-});
+}
 
-// Handle tool calls
+// Extract Overleaf project id from a full URL or accept a bare id.
+function parseOverleafRef(ref) {
+  const trimmed = ref.trim();
+  const urlMatch = trimmed.match(/overleaf\.com\/project\/([a-f0-9]{16,32})/i);
+  if (urlMatch) return urlMatch[1];
+  if (/^[a-f0-9]{16,32}$/i.test(trimmed)) return trimmed;
+  throw new Error(`Could not extract Overleaf project id from "${ref}"`);
+}
+
+// Find the course folder matching <courseCode> under academicRoot/Year <year>/Q*.
+async function findCourseFolder(academicRoot, year, courseCode) {
+  const yearDir = path.join(academicRoot, `Year ${year}`);
+  let quarters;
+  try {
+    quarters = await readdir(yearDir);
+  } catch {
+    throw new Error(`Year folder not found: ${yearDir}`);
+  }
+  const candidates = [];
+  for (const q of quarters) {
+    const qPath = path.join(yearDir, q);
+    let s;
+    try { s = await stat(qPath); } catch { continue; }
+    if (!s.isDirectory()) continue;
+    let entries;
+    try { entries = await readdir(qPath); } catch { continue; }
+    for (const e of entries) {
+      // Course folder convention: code is the first whitespace-delimited token of the folder name.
+      const firstToken = e.split(/[\s_-]/)[0].toUpperCase();
+      if (firstToken === courseCode.toUpperCase()) {
+        candidates.push({ quarter: q, folder: e, path: path.join(qPath, e) });
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    throw new Error(`No folder starting with "${courseCode}" found under any Q* of ${yearDir}`);
+  }
+  if (candidates.length > 1) {
+    throw new Error(`Ambiguous: multiple course folders match "${courseCode}":\n${candidates.map(c => `  ${c.path}`).join('\n')}`);
+  }
+  return candidates[0];
+}
+
+// Wipe a duplicated SSA's body content while preserving the preamble and structure.
+// Returns { changed: [...], skipped: [...] }.
+async function resetSsaContent(repoPath, { ssaName, author, date, readUrl, dryRun } = {}) {
+  const changed = [];
+  const skipped = [];
+
+  // 1. Empty chapter and appendix files matching the canonical layout.
+  const chaptersDir = path.join(repoPath, 'Chapters');
+  let chapterEntries = [];
+  try { chapterEntries = await readdir(chaptersDir); } catch { skipped.push('Chapters/ (missing)'); }
+  for (const f of chapterEntries) {
+    if (!/^(ch\d+|app_[A-Za-z0-9]+)\.tex$/i.test(f)) continue;
+    const p = path.join(chaptersDir, f);
+    if (!dryRun) await writeFile(p, '', 'utf-8');
+    changed.push(`Chapters/${f} (emptied)`);
+  }
+
+  // 2. Empty refs.bib if present.
+  const refsPath = path.join(repoPath, 'refs.bib');
+  try {
+    await access(refsPath);
+    if (!dryRun) await writeFile(refsPath, '', 'utf-8');
+    changed.push('refs.bib (emptied)');
+  } catch { skipped.push('refs.bib (missing)'); }
+
+  // 3. Wipe figures/ contents (keep the dir).
+  const figuresDir = path.join(repoPath, 'figures');
+  let figureEntries = [];
+  try { figureEntries = await readdir(figuresDir); } catch { skipped.push('figures/ (missing)'); }
+  for (const f of figureEntries) {
+    if (f === '.gitkeep') continue;
+    const p = path.join(figuresDir, f);
+    let s;
+    try { s = await stat(p); } catch { continue; }
+    if (s.isFile()) {
+      if (!dryRun) await exec(`rm "${p}"`);
+      changed.push(`figures/${f} (removed)`);
+    } else if (s.isDirectory()) {
+      if (!dryRun) await exec(`rm -rf "${p}"`);
+      changed.push(`figures/${f}/ (removed)`);
+    }
+  }
+
+  // 4. Rewrite title block in main.tex if any header field was provided.
+  if (ssaName || author || date || readUrl) {
+    const mainPath = path.join(repoPath, 'main.tex');
+    let main;
+    try { main = await readFile(mainPath, 'utf-8'); }
+    catch { skipped.push('main.tex (missing — header not rewritten)'); main = null; }
+    if (main) {
+      let updated = main;
+      // Match \title{...} including a \textbf{...} wrapper.
+      if (ssaName) {
+        updated = updated.replace(/\\title\{[^}]*?(?:\{[^}]*\}[^}]*?)*\}/, () => `\\title{\\textbf{${ssaName}}}`);
+        changed.push(`main.tex \\title{} → ${ssaName}`);
+      }
+      if (author) {
+        updated = updated.replace(/\\author\{[^}]*?(?:\{[^}]*\}[^}]*?)*\}/, () => `\\author{\\textbf{${author}}}`);
+        changed.push(`main.tex \\author{} → ${author}`);
+      }
+      if (date) {
+        updated = updated.replace(/\\date\{[^}]*?(?:\{[^}]*\}[^}]*?)*\}/, () => `\\date{\\textbf{${date}}}`);
+        changed.push(`main.tex \\date{} → ${date}`);
+      }
+      if (readUrl) {
+        // Replace any line that is exactly \url{...} (the read-link under \maketitle).
+        if (/\\url\{[^}]*\}/.test(updated)) {
+          updated = updated.replace(/\\url\{[^}]*\}/, `\\url{${readUrl}}`);
+          changed.push(`main.tex \\url{} → ${readUrl}`);
+        } else {
+          skipped.push('main.tex \\url{} (no existing \\url line found)');
+        }
+      }
+      if (!dryRun) await writeFile(mainPath, updated, 'utf-8');
+    }
+  }
+
+  return { changed, skipped };
+}
+
+async function readContext(projectKey, project) {
+  const mdPath = path.join(CONTEXTS_DIR, `${projectKey}.md`);
+  try {
+    await access(mdPath);
+    const md = await readFile(mdPath, 'utf-8');
+    return { source: mdPath, body: md.trim() };
+  } catch {
+    if (project?.context) {
+      return { source: '(inline in projects.json)', body: project.context };
+    }
+    return { source: '(none)', body: `(No context set. Create ${path.relative(__dirname, mdPath)} or call update_context to add notes for this project.)` };
+  }
+}
+
+// MCP server
+const server = new Server(
+  { name: 'overleaf-mcp-server', version: '2.0.0' },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'get_context',
+      description: 'Read writing guidelines + per-project context. Always call this at the start of any writing or editing session, and re-read whenever instructions feel forgotten. Both the guidelines and the project context md are re-read from disk on every call, so external edits take effect immediately without restarting.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          projectName: { type: 'string', description: 'Project key. Omit to auto-detect from current working directory.' },
+        },
+      },
+    },
+    {
+      name: 'list_projects',
+      description: 'List configured Overleaf projects (key, name, projectId, cwd, localPath). Shows which one auto-detects as default from the current CWD.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'bootstrap_ssa',
+      description: 'One-shot setup for a new SSA. Takes the Overleaf URL (or bare project id) and an SSA name in the format "Y<year> <COURSE_CODE> SSA <num>" (e.g. "Y1 ABC123 SSA 5"). Resolves the course folder under settings.academicRoot/Year <year>/Q*, creates settings.ssaSubdir/<ssaName>/ inside it, clones the Overleaf repo into a `overleaf/` subfolder, registers the project (key = slug), and scaffolds contexts/<slug>.md. If `cleanAfterClone` is true, also empties Chapters/ch*.tex, Chapters/app_*.tex, refs.bib, and figures/* and rewrites the title block in main.tex (use after duplicating a previous SSA in Overleaf). Returns a checklist of context questions; after the user answers, follow up with update_context to fill the context md.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          overleafRef: { type: 'string', description: 'Full Overleaf URL (https://www.overleaf.com/project/<id>) or just the project id.' },
+          ssaName: { type: 'string', description: 'SSA name in the form "Y<year> <COURSE_CODE> SSA <num>", e.g. "Y1 ABC123 SSA 5".' },
+          cleanAfterClone: { type: 'boolean', description: 'If true, run reset_ssa_content immediately after the clone (use when duplicating a previous SSA). Defaults to false.' },
+          readUrl: { type: 'string', description: 'Optional Overleaf read-only URL (https://www.overleaf.com/read/...) to inject under the title.' },
+        },
+        required: ['overleafRef', 'ssaName'],
+      },
+    },
+    {
+      name: 'reset_ssa_content',
+      description: 'Empty the body content of a duplicated SSA: clears Chapters/ch*.tex, Chapters/app_*.tex, refs.bib, and figures/* (keeps directories). Optionally rewrites \\title{}, \\author{}, \\date{}, and the standalone \\url{} line in main.tex. Commits and pushes. Run this AFTER duplicating a previous SSA project in the Overleaf web UI and cloning it locally, so you start from a clean slate without touching the preamble.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          projectName: { type: 'string', description: 'Project key. Defaults to the autodetected project.' },
+          ssaName: { type: 'string', description: 'Optional. If given, used to rewrite \\title{}. Recommended format: full assignment title, e.g. "SSA 5 for ABC123 Course Title".' },
+          author: { type: 'string', description: 'Optional. If given, rewrites \\author{}.' },
+          date: { type: 'string', description: 'Optional. If given, rewrites \\date{}.' },
+          readUrl: { type: 'string', description: 'Optional. If given, replaces the standalone \\url{...} line under \\maketitle.' },
+          dryRun: { type: 'boolean', description: 'If true, report what would change but do not write or push.' },
+        },
+      },
+    },
+    {
+      name: 'register_project',
+      description: 'Add or overwrite a project entry in projects.json. Lets you onboard a new Overleaf project without hand-editing JSON. Uses the global gitToken from settings. After registering, also call update_context to set the project notes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Short identifier used to refer to this project (e.g. "ssa4", "thesis"). Becomes the filename of contexts/<key>.md.' },
+          projectId: { type: 'string', description: 'Overleaf project ID (from the URL https://www.overleaf.com/project/<ID>).' },
+          name: { type: 'string', description: 'Human-readable name. Defaults to the key if omitted.' },
+          cwd: { type: 'string', description: 'Local workspace directory where you run Claude for this project. Used for autodetection. Defaults to the current session CWD.' },
+          localPath: { type: 'string', description: 'Where to clone the Overleaf git repo. Defaults to settings.repoDir/<name>.' },
+        },
+        required: ['key', 'projectId'],
+      },
+    },
+    {
+      name: 'set_project_path',
+      description: 'Update the local clone path (localPath) and/or cwd for an existing project without hand-editing JSON.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Project key to update. Defaults to the autodetected project.' },
+          localPath: { type: 'string', description: 'New local clone directory.' },
+          cwd: { type: 'string', description: 'New workspace directory for autodetection.' },
+        },
+      },
+    },
+    {
+      name: 'update_context',
+      description: 'Replace (or append to) the project context md at contexts/<key>.md. Use this to record assignment-specific notes, terminology, deadlines, structure constraints. Takes effect immediately — no restart needed.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Project key. Defaults to the autodetected project.' },
+          content: { type: 'string', description: 'New context body (markdown).' },
+          mode: { type: 'string', enum: ['replace', 'append'], description: 'replace (default) or append.' },
+        },
+        required: ['content'],
+      },
+    },
+    {
+      name: 'list_files',
+      description: 'List files in the Overleaf project, filtered by extension.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          projectName: { type: 'string' },
+          extension: { type: 'string', description: 'e.g. ".tex", ".bib". Defaults to ".tex".' },
+        },
+      },
+    },
+    {
+      name: 'read_file',
+      description: 'Read a file from the Overleaf project.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string' },
+          projectName: { type: 'string' },
+        },
+        required: ['filePath'],
+      },
+    },
+    {
+      name: 'get_sections',
+      description: 'List \\section / \\subsection / \\subsubsection entries in a .tex file.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string' },
+          projectName: { type: 'string' },
+        },
+        required: ['filePath'],
+      },
+    },
+    {
+      name: 'get_section_content',
+      description: 'Get the body of a single section by title.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string' },
+          sectionTitle: { type: 'string' },
+          projectName: { type: 'string' },
+        },
+        required: ['filePath', 'sectionTitle'],
+      },
+    },
+    {
+      name: 'compile_file',
+      description: 'Compile a .tex file locally with LuaLaTeX (default), XeLaTeX, or pdfLaTeX. Pulls before compiling. ALWAYS run this after write_file before declaring work done — silent build breakage is the most common failure mode.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string' },
+          engine: { type: 'string', description: 'pdflatex | xelatex | lualatex (default lualatex)' },
+          projectName: { type: 'string' },
+        },
+        required: ['filePath'],
+      },
+    },
+    {
+      name: 'write_file',
+      description: 'Write full file contents and push to Overleaf. After calling, ALWAYS call compile_file on the project entrypoint (usually main.tex) to verify the build still works. Do not declare a writing task complete without a successful compile.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string' },
+          content: { type: 'string' },
+          commitMessage: { type: 'string' },
+          projectName: { type: 'string' },
+        },
+        required: ['filePath', 'content'],
+      },
+    },
+    {
+      name: 'status_summary',
+      description: 'High-level project status: file count, main file, sections.',
+      inputSchema: {
+        type: 'object',
+        properties: { projectName: { type: 'string' } },
+      },
+    },
+  ],
+}));
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     const { name, arguments: args } = request.params;
 
     switch (name) {
       case 'list_projects': {
-        const projects = Object.entries(projectsConfig.projects).map(([key, project]) => ({
-          id: key,
-          name: project.name,
-          projectId: project.projectId,
+        const config = await loadConfig();
+        const autodetected = (() => { try { return pickProjectKey(config); } catch { return null; } })();
+        const projects = Object.entries(config.projects).map(([key, p]) => ({
+          key,
+          name: p.name,
+          projectId: p.projectId,
+          cwd: p.cwd || null,
+          localPath: resolveLocalPath(config, key, p),
+          autodetected: key === autodetected,
         }));
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(projects, null, 2),
-            },
-          ],
+        return { content: [{ type: 'text', text: `Session CWD: ${SESSION_CWD}\n\n${JSON.stringify(projects, null, 2)}` }] };
+      }
+
+      case 'bootstrap_ssa': {
+        const config = await loadConfig();
+        const academicRoot = config.settings?.academicRoot;
+        if (!academicRoot) throw new Error('settings.academicRoot not set in projects.json');
+        const ssaSubdir = config.settings?.ssaSubdir || 'MY SSAs';
+
+        const parsed = parseSsaName(args.ssaName);
+        const projectId = parseOverleafRef(args.overleafRef);
+        const course = await findCourseFolder(academicRoot, parsed.year, parsed.courseCode);
+
+        const workspaceDir = path.join(course.path, ssaSubdir, args.ssaName.trim());
+        const cloneDir = path.join(workspaceDir, 'overleaf');
+        await mkdir(workspaceDir, { recursive: true });
+
+        // Register the project so the MCP knows about it.
+        const entry = {
+          name: args.ssaName.trim(),
+          projectId,
+          cwd: workspaceDir,
+          localPath: cloneDir,
         };
+        config.projects[parsed.slug] = entry;
+        await saveConfig(config);
+
+        // Trigger clone now so user immediately has files locally.
+        const gitToken = resolveGitToken(config, entry);
+        const client = new OverleafGitClient(projectId, gitToken, cloneDir);
+        let cloneStatus;
+        let cleanReport = null;
+        try {
+          await client.cloneOrPull();
+          cloneStatus = `✓ Cloned ${projectId} → ${cloneDir}`;
+          if (args.cleanAfterClone) {
+            // Course folder convention: "<CODE> - <descriptor>" → descriptor for the title.
+            const descriptor = course.folder.split(/\s*-\s*/).slice(1).join(' - ').trim();
+            const fullTitle = descriptor
+              ? `SSA ${parsed.ssaNum} for ${parsed.courseCode} ${descriptor}`
+              : `SSA ${parsed.ssaNum} for ${parsed.courseCode}`;
+            const reset = await resetSsaContent(cloneDir, {
+              ssaName: fullTitle,
+              readUrl: args.readUrl,
+            });
+            // Stage + commit + push the wipe so Overleaf reflects it.
+            await exec(`cd "${cloneDir}" && git config user.email "claude@anthropic.com" && git config user.name "Claude"`);
+            await exec(`cd "${cloneDir}" && git add -A`);
+            try {
+              await exec(`cd "${cloneDir}" && git commit -m "Reset content for ${args.ssaName.trim()}"`);
+              await exec(`cd "${cloneDir}" && git push https://git:${gitToken}@git.overleaf.com/${projectId} HEAD`);
+              cleanReport = reset;
+            } catch (e) {
+              if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) cleanReport = { ...reset, note: 'nothing to commit' };
+              else cleanReport = { ...reset, note: `commit/push failed: ${e.message}` };
+            }
+          }
+        } catch (e) {
+          cloneStatus = `✗ Clone failed: ${e.message}\n  (project is still registered; fix the token or id and call list_files to retry)`;
+        }
+
+        // Scaffold context md with a question template.
+        await mkdir(CONTEXTS_DIR, { recursive: true });
+        const ctxPath = path.join(CONTEXTS_DIR, `${parsed.slug}.md`);
+        const scaffold = `# ${args.ssaName.trim()}
+
+> Fill these in. Each block is here because past SSAs have needed it. Drop blocks that genuinely do not apply, but do not leave them blank — empty context is the most common reason Claude drifts.
+
+## Topic and scope
+- What is this SSA actually about? One paragraph in your own words.
+- What is in scope, and what is explicitly out of scope?
+
+## Deadline and submission
+- Hard deadline (date + time):
+- Submission target (Canvas, hand-in, etc.):
+- Page or length limit, if any:
+
+## Collaborators and division of labour
+- Who else is on this SSA:
+- Who is doing what:
+- What you specifically own:
+
+## Pinned decisions
+- Decisions already made that should not be re-litigated mid-draft:
+
+## Source material
+- Lecture notes / chapters / datasheets / papers you are working from:
+- Citation style (default IEEE):
+
+## Structure constraints
+- Required sections (Goals, Summary, Details, etc.) in order:
+- Anything unusual (e.g. an appendix the assignment requires):
+
+## Known unknowns
+- Things that are still open and will need updating:
+
+## Other context
+- Anything else Claude should keep in mind throughout the write-up:
+`;
+        try { await access(ctxPath); }
+        catch { await writeFile(ctxPath, scaffold, 'utf-8'); }
+
+        const checklist = [
+          '',
+          '## Next step — set up context',
+          '',
+          'Ask the user for the following, one block at a time, then call `update_context` (mode=replace) with the filled-in context md. Do not invent answers.',
+          '',
+          '1. Topic & scope (one paragraph + what is out of scope)',
+          '2. Deadline and submission target (date, time, length limit if any)',
+          '3. Collaborators and division of labour',
+          '4. Pinned decisions to respect',
+          '5. Source material (lecture notes, chapters, datasheets, papers)',
+          '6. Required section structure (any deviations from the standard SSA layout)',
+          '7. Known unknowns and anything else relevant',
+          '',
+          'After collecting, write the populated context md via `update_context` with `key: "' + parsed.slug + '"`.',
+        ].join('\n');
+
+        const lines = [
+          `# Bootstrapped ${args.ssaName.trim()}`,
+          ``,
+          `**Course folder:** ${course.path}`,
+          `**Workspace:** ${workspaceDir}`,
+          `**Overleaf clone:** ${cloneDir}`,
+          `**Project key:** \`${parsed.slug}\``,
+          `**Context md:** ${path.relative(__dirname, ctxPath)}`,
+          ``,
+          cloneStatus,
+        ];
+        if (cleanReport) {
+          lines.push('', '## Clean report');
+          for (const c of cleanReport.changed) lines.push(`- ${c}`);
+          for (const s of cleanReport.skipped) lines.push(`- (skipped) ${s}`);
+          if (cleanReport.note) lines.push(`- note: ${cleanReport.note}`);
+        }
+        lines.push(checklist);
+
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+
+      case 'reset_ssa_content': {
+        const { client, project } = await getClient(args.projectName);
+        await client.cloneOrPull();
+        const report = await resetSsaContent(client.repoPath, {
+          ssaName: args.ssaName,
+          author: args.author,
+          date: args.date,
+          readUrl: args.readUrl,
+          dryRun: args.dryRun,
+        });
+        let pushNote = '';
+        if (!args.dryRun) {
+          await exec(`cd "${client.repoPath}" && git config user.email "claude@anthropic.com" && git config user.name "Claude"`);
+          await exec(`cd "${client.repoPath}" && git add -A`);
+          try {
+            await exec(`cd "${client.repoPath}" && git commit -m "Reset SSA content"`);
+            await exec(`cd "${client.repoPath}" && git push https://git:${client.gitToken}@git.overleaf.com/${client.projectId} HEAD`);
+            pushNote = '✓ Pushed to Overleaf.';
+          } catch (e) {
+            if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) pushNote = '(nothing to commit — already clean)';
+            else pushNote = `✗ commit/push failed: ${e.message}`;
+          }
+        } else {
+          pushNote = '(dryRun — nothing written or pushed)';
+        }
+        const out = [
+          `# Reset ${project.name}`,
+          ``,
+          ...report.changed.map(c => `- ${c}`),
+          ...report.skipped.map(s => `- (skipped) ${s}`),
+          ``,
+          pushNote,
+        ];
+        return { content: [{ type: 'text', text: out.join('\n') }] };
+      }
+
+      case 'register_project': {
+        const config = await loadConfig();
+        if (!args.key || !args.projectId) throw new Error('key and projectId are required');
+        const entry = {
+          name: args.name || args.key,
+          projectId: args.projectId,
+        };
+        if (args.cwd) entry.cwd = args.cwd;
+        else if (SESSION_CWD) entry.cwd = SESSION_CWD;
+        if (args.localPath) entry.localPath = args.localPath;
+        config.projects[args.key] = entry;
+        await saveConfig(config);
+        await mkdir(CONTEXTS_DIR, { recursive: true });
+        const ctxPath = path.join(CONTEXTS_DIR, `${args.key}.md`);
+        try { await access(ctxPath); } catch {
+          await writeFile(ctxPath, `# ${entry.name}\n\n(Context placeholder. Call update_context to fill this in, or edit ${path.relative(__dirname, ctxPath)} directly.)\n`, 'utf-8');
+        }
+        return { content: [{ type: 'text', text: `Registered "${args.key}" → ${args.projectId}\ncwd: ${entry.cwd || '(none)'}\nlocalPath: ${resolveLocalPath(config, args.key, entry)}\ncontext: ${path.relative(__dirname, ctxPath)}` }] };
+      }
+
+      case 'set_project_path': {
+        const config = await loadConfig();
+        const key = args.key || pickProjectKey(config);
+        const p = config.projects[key];
+        if (!p) throw new Error(`Project "${key}" not found`);
+        if (args.localPath) p.localPath = args.localPath;
+        if (args.cwd) p.cwd = args.cwd;
+        await saveConfig(config);
+        return { content: [{ type: 'text', text: `Updated "${key}":\n  cwd: ${p.cwd || '(unset)'}\n  localPath: ${resolveLocalPath(config, key, p)}` }] };
+      }
+
+      case 'update_context': {
+        const config = await loadConfig();
+        const key = args.key || pickProjectKey(config);
+        if (!config.projects[key]) throw new Error(`Project "${key}" not found`);
+        await mkdir(CONTEXTS_DIR, { recursive: true });
+        const ctxPath = path.join(CONTEXTS_DIR, `${key}.md`);
+        const mode = args.mode || 'replace';
+        let body = args.content;
+        if (mode === 'append') {
+          let existing = '';
+          try { existing = await readFile(ctxPath, 'utf-8'); } catch { /* none */ }
+          body = existing.replace(/\s+$/, '') + '\n\n' + args.content + '\n';
+        } else if (!body.endsWith('\n')) {
+          body += '\n';
+        }
+        await writeFile(ctxPath, body, 'utf-8');
+        return { content: [{ type: 'text', text: `Wrote context for "${key}" → ${path.relative(__dirname, ctxPath)} (${mode})` }] };
+      }
+
+      case 'get_context': {
+        const config = await loadConfig();
+        const key = pickProjectKey(config, args.projectName);
+        const project = config.projects[key];
+        let guidelines = '';
+        try { guidelines = await readFile(GUIDELINES_PATH, 'utf-8'); }
+        catch { guidelines = '(writing-guidelines.md missing from OverleafMCP folder)'; }
+        const ctx = await readContext(key, project);
+        const text = [
+          `# Writing Context`,
+          ``,
+          `**Active project:** \`${key}\` — ${project.name}`,
+          `**Context source:** ${ctx.source}`,
+          ``,
+          `---`,
+          ``,
+          `## Global Guidelines`,
+          ``,
+          guidelines.trim(),
+          ``,
+          `---`,
+          ``,
+          `## Project Context — ${project.name}`,
+          ``,
+          ctx.body,
+        ].join('\n');
+        return { content: [{ type: 'text', text }] };
       }
 
       case 'list_files': {
-        const client = getProject(args.projectName);
+        const { client } = await getClient(args.projectName);
         const files = await client.listFiles(args.extension || '.tex');
-        return {
-          content: [
-            {
-              type: 'text',
-              text: files.join('\n'),
-            },
-          ],
-        };
+        return { content: [{ type: 'text', text: files.join('\n') }] };
       }
 
       case 'read_file': {
-        const client = getProject(args.projectName);
+        const { client } = await getClient(args.projectName);
         const content = await client.readFile(args.filePath);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: content,
-            },
-          ],
-        };
+        return { content: [{ type: 'text', text: content }] };
       }
 
       case 'get_sections': {
-        const client = getProject(args.projectName);
+        const { client } = await getClient(args.projectName);
         const sections = await client.getSections(args.filePath);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(sections, null, 2),
-            },
-          ],
-        };
+        return { content: [{ type: 'text', text: JSON.stringify(sections, null, 2) }] };
       }
 
       case 'get_section_content': {
-        const client = getProject(args.projectName);
+        const { client } = await getClient(args.projectName);
         const content = await client.getSectionContent(args.filePath, args.sectionTitle);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: content,
-            },
-          ],
-        };
+        return { content: [{ type: 'text', text: content }] };
+      }
+
+      case 'compile_file': {
+        const { client } = await getClient(args.projectName);
+        const result = await client.compileFile(args.filePath, args.engine || 'lualatex');
+        const status = result.pdfPath ? `✓ PDF written to ${result.pdfPath}` : '✗ Compilation failed — no PDF produced';
+        return { content: [{ type: 'text', text: `${status}\n\n--- Output ---\n${result.stdout}\n${result.stderr ? `\n--- Errors ---\n${result.stderr}` : ''}`.trim() }] };
+      }
+
+      case 'write_file': {
+        const { client } = await getClient(args.projectName);
+        const res = await client.writeFile(args.filePath, args.content, args.commitMessage);
+        const tail = res.pushed
+          ? `Pushed ${args.filePath}. NEXT STEP: call compile_file on the project main .tex to verify the build still works before declaring done.`
+          : `No changes detected for ${args.filePath} (${res.reason}).`;
+        return { content: [{ type: 'text', text: tail }] };
       }
 
       case 'status_summary': {
-        const client = getProject(args.projectName);
+        const { client, key, project } = await getClient(args.projectName);
         const files = await client.listFiles();
-        const mainFile = files.find(f => f.includes('main.tex')) || files[0];
+        const mainFile = files.find(f => /(^|\/)main\.tex$/.test(f)) || files[0];
         let sections = [];
-        
-        if (mainFile) {
-          sections = await client.getSections(mainFile);
-        }
-        
+        if (mainFile) sections = await client.getSections(mainFile);
         return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                totalFiles: files.length,
-                mainFile,
-                totalSections: sections.length,
-                files: files.slice(0, 10),
-              }, null, 2),
-            },
-          ],
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              activeProjectKey: key,
+              activeProjectName: project.name,
+              totalFiles: files.length,
+              mainFile,
+              totalSections: sections.length,
+              files: files.slice(0, 20),
+            }, null, 2),
+          }],
         };
       }
 
@@ -339,22 +871,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (error) {
     return {
-      content: [
-        {
-          type: 'text',
-          text: `Error: ${error.message}`,
-        },
-      ],
+      content: [{ type: 'text', text: `Error: ${error.message}` }],
       isError: true,
     };
   }
 });
 
-// Start server
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('Overleaf MCP server running on stdio');
+  console.error(`Overleaf MCP server v2 running on stdio (session cwd: ${SESSION_CWD})`);
 }
 
 main().catch((error) => {

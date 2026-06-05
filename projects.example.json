@@ -1,14 +1,21 @@
 {
+  "settings": {
+    "gitToken": "olp_REPLACE_WITH_YOUR_OVERLEAF_GIT_TOKEN",
+    "repoDir": "/Users/you/PDFs/Overleaf GIT",
+    "academicRoot": "/Users/you/PDFs/School/Textbooks and Syllabus",
+    "ssaSubdir": "MY SSAs"
+  },
   "projects": {
     "default": {
       "name": "My Paper",
       "projectId": "YOUR_PROJECT_ID",
-      "gitToken": "YOUR_GIT_TOKEN"
+      "cwd": "/Users/you/where/you/run/claude/for/this/project"
     },
-    "project2": {
-      "name": "Another Paper",
-      "projectId": "ANOTHER_PROJECT_ID", 
-      "gitToken": "ANOTHER_GIT_TOKEN"
+    "thesis": {
+      "name": "Thesis",
+      "projectId": "ANOTHER_PROJECT_ID",
+      "cwd": "/Users/you/Documents/Thesis",
+      "localPath": "/custom/clone/path"
     }
   }
 }
