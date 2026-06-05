@@ -393,6 +393,27 @@ class OverleafGitClient {
     return { pushed: true, label: name, restoredTo: tree };
   }
 
+  // Run the configured voice linter on a file; advisory, read-only.
+  // exit 0 -> clean; exit 2 -> findings (stderr); other -> error. command is
+  // tokenized (no shell); a leading ~ in any token expands to the home dir.
+  async voiceLint(filePath, { command } = {}) {
+    if (!command || !command.trim()) {
+      throw new Error('No voice linter configured (set settings.voiceLinter in projects.json).');
+    }
+    await this.cloneOrPull();
+    const abs = path.join(this.repoPath, filePath);
+    const home = os.homedir();
+    const parts = command.trim().split(/\s+/).map(t => (t.startsWith('~') ? home + t.slice(1) : t));
+    const [prog, ...rest] = parts;
+    try {
+      const { stdout, stderr } = await execFile(prog, [...rest, abs], { maxBuffer: 4 * 1024 * 1024 });
+      return { clean: true, findings: (stderr || stdout || '').trim() };
+    } catch (e) {
+      if (e.code === 2) return { clean: false, findings: (e.stderr || e.stdout || '').trim() };
+      throw new Error(`voice linter failed (exit ${e.code}): ${(e.stderr || e.message || '').slice(0, 200)}`);
+    }
+  }
+
   async commitAndPush(message, { addAll = false, addPath } = {}) {
     await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
     await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
@@ -1038,6 +1059,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: 'object', properties: { label: { type: 'string' }, projectName: { type: 'string' } }, required: ['label'] },
     },
     {
+      name: 'voice_lint',
+      description: 'Lint a .tex file for the configured voice rules (settings.voiceLinter, default /path/to/your/voice_lint.py). Read-only and advisory — reports findings, never blocks. Run after editing SSA prose via edit_file/write_file, which bypass the local Edit/Write voice hooks.',
+      inputSchema: {
+        type: 'object',
+        properties: { filePath: { type: 'string' }, projectName: { type: 'string' } },
+        required: ['filePath'],
+      },
+    },
+    {
       name: 'status_summary',
       description: 'High-level project status: file count, main file, sections.',
       inputSchema: {
@@ -1439,6 +1469,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { client } = await getClient(args.projectName);
         const r = await client.restore(args.label);
         return { content: [{ type: 'text', text: `Restored "${r.label}" and pushed (forward commit). Run compile_file/verify_build to confirm.` }] };
+      }
+
+      case 'voice_lint': {
+        const config = await loadConfig();
+        const { client } = await getClient(args.projectName);
+        const command = config.settings?.voiceLinter || 'python3 /path/to/your/voice_lint.py';
+        const r = await client.voiceLint(args.filePath, { command });
+        return { content: [{ type: 'text', text: r.clean ? `✓ voice OK — ${args.filePath}${r.findings ? `\n${r.findings}` : ''}` : `voice findings in ${args.filePath}:\n${r.findings}` }] };
       }
 
       case 'status_summary': {
