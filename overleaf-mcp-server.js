@@ -277,6 +277,122 @@ class OverleafGitClient {
     return verdict;
   }
 
+  // Read-only grep across tracked files. Regex by default; fixed -> -F; ignoreCase -> -i.
+  async searchText({ query, fixed = false, ignoreCase = false, extension } = {}) {
+    if (!query) throw new Error('search_text needs a query.');
+    await this.cloneOrPull();
+    const args = ['-C', this.repoPath, 'grep', '-n', '--no-color', fixed ? '-F' : '-E'];
+    if (ignoreCase) args.push('-i');
+    args.push('-e', query);
+    if (extension) args.push('--', `*${extension}`);
+    try {
+      const { stdout } = await this._git(args);
+      const lines = stdout.split('\n').filter(Boolean);
+      return { matches: lines.slice(0, 200), total: lines.length };
+    } catch (e) {
+      if (e.code === 1 && !(e.stderr && e.stderr.trim())) return { matches: [], total: 0 }; // git grep: no matches
+      throw e;
+    }
+  }
+
+  // Append a BibTeX entry to refs.bib (reject a duplicate key), commit, push.
+  async addCitation({ entry, commitMessage } = {}) {
+    if (!entry || !entry.trim()) throw new Error('add_citation needs a BibTeX entry.');
+    const m = entry.match(/@\w+\s*\{\s*([^,\s]+)/);
+    if (!m) throw new Error('Could not find a BibTeX key in the entry (expected @type{key, ...}).');
+    const key = m[1];
+    await this.cloneOrPull();
+    const bibPath = path.join(this.repoPath, 'refs.bib');
+    let current = '';
+    try { current = await readFile(bibPath, 'utf-8'); } catch { /* missing -> create */ }
+    const dup = new RegExp(`@\\w+\\s*\\{\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*,`);
+    if (dup.test(current)) throw new Error(`citation key "${key}" already in refs.bib.`);
+    await writeFile(bibPath, current.replace(/\s*$/, '') + '\n\n' + entry.trim() + '\n', 'utf-8');
+    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
+    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
+    await this._git(['-C', this.repoPath, 'add', '--', 'refs.bib']);
+    try {
+      await this._git(['-C', this.repoPath, 'commit', '-m', commitMessage || `Add citation ${key}`]);
+    } catch (e) {
+      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) return { pushed: false, reason: 'nothing to commit', key };
+      throw e;
+    }
+    return { ...(await this._pushWithMerge()), key };
+  }
+
+  // Read-only: cited keys (across .tex) vs defined keys (refs.bib).
+  async citeLint() {
+    await this.cloneOrPull();
+    const texFiles = await this.listFiles('.tex');
+    const citeRe = /\\(?:cite|autocite|parencite|citep|citet|textcite|footcite|nocite)\*?(?:\[[^\]]*\])*\{([^}]+)\}/g;
+    const cited = new Set();
+    for (const f of texFiles) {
+      const content = await readFile(path.join(this.repoPath, f), 'utf-8');
+      let m;
+      while ((m = citeRe.exec(content)) !== null) {
+        for (const k of m[1].split(',')) {
+          const key = k.trim();
+          if (key && key !== '*') cited.add(key);
+        }
+      }
+    }
+    let bib = '';
+    try { bib = await readFile(path.join(this.repoPath, 'refs.bib'), 'utf-8'); } catch { /* none */ }
+    const defined = new Set();
+    let bm;
+    const defRe = /@(\w+)\s*\{\s*([^,\s]+)/g;
+    while ((bm = defRe.exec(bib)) !== null) {
+      const type = bm[1].toLowerCase();
+      if (type === 'string' || type === 'comment' || type === 'preamble') continue;
+      defined.add(bm[2]);
+    }
+    return {
+      undefined: [...cited].filter(k => !defined.has(k)).sort(),
+      unused: [...defined].filter(k => !cited.has(k)).sort(),
+      cited: cited.size,
+      defined: defined.size,
+    };
+  }
+
+  // Local rollback point: a lightweight tag mcp-snap/<label> at HEAD (not pushed).
+  async checkpoint(label) {
+    await this.cloneOrPull();
+    const name = `mcp-snap/${(label && label.trim()) || `snap-${Date.now()}`}`;
+    let exists = false;
+    try { await this._git(['-C', this.repoPath, 'rev-parse', '--verify', '--quiet', `refs/tags/${name}`]); exists = true; } catch { exists = false; }
+    if (exists) throw new Error(`snapshot "${name}" already exists; choose a different label.`);
+    await this._git(['-C', this.repoPath, 'tag', name]);
+    const { stdout } = await this._git(['-C', this.repoPath, 'rev-parse', 'HEAD']);
+    return { label: name, head: stdout.trim() };
+  }
+
+  // Forward-restore the snapshot's tree as a new commit on top of HEAD, then push.
+  // No history rewrite, no force-push (the new commit descends from HEAD).
+  async restore(label) {
+    await this.cloneOrPull();
+    const name = String(label || '').startsWith('mcp-snap/') ? label : `mcp-snap/${label}`;
+    let tree;
+    try { ({ stdout: tree } = await this._git(['-C', this.repoPath, 'rev-parse', `${name}^{tree}`])); }
+    catch {
+      const tags = await this._git(['-C', this.repoPath, 'tag', '--list', 'mcp-snap/*']).then(r => r.stdout.trim()).catch(() => '');
+      throw new Error(`snapshot "${name}" not found. Available: ${tags || '(none)'}`);
+    }
+    tree = tree.trim();
+    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
+    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
+    const { stdout: commit } = await this._git(['-C', this.repoPath, 'commit-tree', tree, '-p', 'HEAD', '-m', `restore: ${name}`]);
+    await this._git(['-C', this.repoPath, 'reset', '--hard', commit.trim()]);
+    try {
+      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
+    } catch (e) {
+      const branch = await this._currentBranch();
+      await this._git(['-C', this.repoPath, 'fetch', 'origin'], { auth: true }).catch(() => {});
+      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
+      throw new Error(`restore: Overleaf moved during the rollback; refused. Re-run after re-pulling. (${(e.stderr || e.message || '').slice(0, 120)})`);
+    }
+    return { pushed: true, label: name, restoredTo: tree };
+  }
+
   async commitAndPush(message, { addAll = false, addPath } = {}) {
     await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
     await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
@@ -879,6 +995,49 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'search_text',
+      description: 'Grep across the project\'s tracked files (find a \\label, a duplicate key, every \\autoref, etc.). Read-only. Regex by default; fixed:true for a literal string; ignoreCase:true for -i; extension (e.g. ".tex") restricts the file set. Returns file:line:match.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Pattern (POSIX extended regex unless fixed:true).' },
+          fixed: { type: 'boolean', description: 'Treat query as a literal string (-F).' },
+          ignoreCase: { type: 'boolean', description: 'Case-insensitive (-i).' },
+          extension: { type: 'string', description: 'Restrict to files with this extension, e.g. ".tex".' },
+          projectName: { type: 'string' },
+        },
+        required: ['query'],
+      },
+    },
+    {
+      name: 'add_citation',
+      description: 'Append a BibTeX entry (raw @type{key, ...} string) to refs.bib and push. Refuses if the key already exists. Creates refs.bib if absent.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          entry: { type: 'string', description: 'A complete BibTeX entry, e.g. @article{key, title={...}, ...}.' },
+          commitMessage: { type: 'string' },
+          projectName: { type: 'string' },
+        },
+        required: ['entry'],
+      },
+    },
+    {
+      name: 'cite_lint',
+      description: 'Report citation problems: undefined (\\cite keys with no refs.bib entry) and unused (refs.bib entries never cited). Read-only. Run before verify_build to catch undefined citations early.',
+      inputSchema: { type: 'object', properties: { projectName: { type: 'string' } } },
+    },
+    {
+      name: 'checkpoint',
+      description: 'Mark a local rollback point (a git tag mcp-snap/<label>) at the current state before a risky edit. label defaults to a timestamp. Local only (not pushed). Use restore to roll back.',
+      inputSchema: { type: 'object', properties: { label: { type: 'string' }, projectName: { type: 'string' } } },
+    },
+    {
+      name: 'restore',
+      description: 'Roll back to a checkpoint: re-applies the snapshot\'s file tree as a NEW commit on top of history and pushes (no force-push, no history rewrite). Overleaf reflects the rollback; intervening commits are preserved.',
+      inputSchema: { type: 'object', properties: { label: { type: 'string' }, projectName: { type: 'string' } }, required: ['label'] },
+    },
+    {
       name: 'status_summary',
       description: 'High-level project status: file count, main file, sections.',
       inputSchema: {
@@ -1245,6 +1404,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ? `Uploaded ${res.files.length} file(s): ${res.files.join(', ')}. NEXT: reference each figure with \\includegraphics{...} via edit_file, then compile_file.`
           : `No upload performed (${res.reason}).`;
         return { content: [{ type: 'text', text: tail }] };
+      }
+
+      case 'search_text': {
+        const { client } = await getClient(args.projectName);
+        const r = await client.searchText({ query: args.query, fixed: args.fixed, ignoreCase: args.ignoreCase, extension: args.extension });
+        if (!r.total) return { content: [{ type: 'text', text: `No matches for ${JSON.stringify(args.query)}.` }] };
+        const more = r.total > r.matches.length ? `\n… (+${r.total - r.matches.length} more)` : '';
+        return { content: [{ type: 'text', text: `${r.total} match(es):\n${r.matches.join('\n')}${more}` }] };
+      }
+
+      case 'add_citation': {
+        const { client } = await getClient(args.projectName);
+        const res = await client.addCitation({ entry: args.entry, commitMessage: args.commitMessage });
+        return { content: [{ type: 'text', text: res.pushed ? `Added citation "${res.key}" to refs.bib and pushed.` : `No change for "${res.key}" (${res.reason}).` }] };
+      }
+
+      case 'cite_lint': {
+        const { client } = await getClient(args.projectName);
+        const r = await client.citeLint();
+        const parts = [`Citations: ${r.cited} cited, ${r.defined} defined.`];
+        parts.push(r.undefined.length ? `✗ undefined (${r.undefined.length}): ${r.undefined.join(', ')}` : '✓ no undefined citations');
+        parts.push(r.unused.length ? `unused (${r.unused.length}): ${r.unused.join(', ')}` : '✓ no unused entries');
+        return { content: [{ type: 'text', text: parts.join('\n') }] };
+      }
+
+      case 'checkpoint': {
+        const { client } = await getClient(args.projectName);
+        const r = await client.checkpoint(args.label);
+        return { content: [{ type: 'text', text: `Checkpoint "${r.label}" at ${r.head.slice(0, 12)}. Roll back with restore("${r.label.replace('mcp-snap/', '')}").` }] };
+      }
+
+      case 'restore': {
+        const { client } = await getClient(args.projectName);
+        const r = await client.restore(args.label);
+        return { content: [{ type: 'text', text: `Restored "${r.label}" and pushed (forward commit). Run compile_file/verify_build to confirm.` }] };
       }
 
       case 'status_summary': {
