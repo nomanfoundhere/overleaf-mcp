@@ -166,7 +166,7 @@ Natural parenthetical commentary, including informal practical remarks, is welco
 
 ### 3.9 Internal cross-referencing
 
-Reference earlier sections when building on them. Do not re-derive — point back. "The six-month deficit established in Section 1" is fine and expected. Same across SSAs: "Going back to Teammate's and Teammate's SSA 3..."
+Reference earlier sections when building on them. Do not re-derive, point back. "The six-month deficit established in Section 1" is fine and expected. The same holds across a series: "Going back to the analysis in an earlier SSA..."
 
 ### 3.10 Meta-commentary
 

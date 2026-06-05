@@ -106,7 +106,7 @@ A typical editing session, in the model's words:
 2. *"Show me the sections in `Chapters/ch2.tex`."* → `get_sections`
 3. *"In `Chapters/ch2.tex`, change `\section{Intro}` to `\section{Introduction}`."* → `edit_file` (anchored, conflict-safe)
 4. *"Add a figure: upload `~/plots/fig1.png` to `figures/fig1.png`."* → `upload_file`
-5. *"Verify the build."* → `verify_build` → `✓ PASS — 23 pages`
+5. *"Verify the build."* → `verify_build` → `✓ PASS — 12 pages`
 
 Every write commits and pushes to Overleaf; `verify_build` is the gate before calling the work done.
 
@@ -121,7 +121,7 @@ Edits never silently overwrite a concurrent Overleaf change.
 
 ## Bootstrap for recurring structured documents
 
-`bootstrap_ssa` automates the repetitive setup for documents you create on a recurring schedule, where each instance lives in a predictable folder and follows a naming convention. The built-in convention targets SSAs (a recurring TU Eindhoven assignment), but the same shape fits lab notes, weekly reports, meeting minutes, or journal entries.
+`bootstrap_ssa` automates the repetitive setup for documents you create on a recurring schedule, where each instance lives in a predictable folder and follows a naming convention. The built-in convention targets SSAs (the recurring coursework format this fork was built around), but the same shape fits lab notes, weekly reports, meeting minutes, or journal entries.
 
 > Bootstrap `https://www.overleaf.com/project/abc123` as `Y1 ABC123 SSA 5`.
 
