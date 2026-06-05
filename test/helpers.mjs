@@ -1,6 +1,6 @@
 import { execFile as ef } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, mkdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -18,7 +18,9 @@ export async function makeRemote(files = { 'main.tex': 'hello\n' }) {
   await git(seed, ['config', 'user.email', 'seed@test']);
   await git(seed, ['config', 'user.name', 'Seed']);
   for (const [name, body] of Object.entries(files)) {
-    await writeFile(path.join(seed, name), body, 'utf-8');
+    const fp = path.join(seed, name);
+    await mkdir(path.dirname(fp), { recursive: true });
+    await writeFile(fp, body, 'utf-8');
     await git(seed, ['add', name]);
   }
   await git(seed, ['commit', '-m', 'seed']);
@@ -30,7 +32,9 @@ export async function makeRemote(files = { 'main.tex': 'hello\n' }) {
     // simulate a concurrent Overleaf edit: commit `body` to `name` and push to the remote
     async remoteEdit(name, body) {
       await git(seed, ['pull', '--ff-only']);
-      await writeFile(path.join(seed, name), body, 'utf-8');
+      const fp = path.join(seed, name);
+      await mkdir(path.dirname(fp), { recursive: true });
+      await writeFile(fp, body, 'utf-8');
       await git(seed, ['add', name]);
       await git(seed, ['commit', '-m', `remote edit ${name}`]);
       await git(seed, ['push', 'origin', 'master']);
@@ -42,6 +46,12 @@ export async function makeRemote(files = { 'main.tex': 'hello\n' }) {
 // Fresh client clone dir under the same temp root.
 export function clientClonePath(root) {
   return path.join(root, 'client');
+}
+
+// Pull the seed clone and read a pushed file's raw bytes (Buffer) — for verifying uploads.
+export async function readFromRemote(r, relPath) {
+  await git(r.seedClone, ['pull', '--ff-only']);
+  return readFile(path.join(r.seedClone, relPath));
 }
 
 // Assert the client clone is clean and at the remote tip.
