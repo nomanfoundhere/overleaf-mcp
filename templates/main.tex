@@ -1,135 +1,30 @@
-%% ----- Document Class -----
+%% Example document template for overleaf-forge's bootstrap_ssa scaffold.
+%%
+%% The tokens __SSA_TITLE__, __SSA_DATE__, and __OVERLEAF_READ_URL__ are
+%% substituted at scaffold time; \author is rewritten when an author is passed.
+%% This is a deliberately plain starting point. Replace it with your own house
+%% style and point settings.templatesDir (or $OVERLEAF_MCP_TEMPLATES) at your copy.
+%% The chapter/appendix/refs layout below matches what reset_ssa_content expects
+%% (Chapters/ch*.tex, Chapters/app_*.tex, refs.bib, figures/).
 \documentclass[a4paper]{article}
 
-%% ----- Font -----
 \usepackage[T1]{fontenc}
-\usepackage[RMstyle=Light,SSstyle=Text,TTstyle=Light,DefaultFeatures={Ligatures=Common}]{plex-otf}
-\renewcommand*\familydefault{\sfdefault}
-
-\usepackage[basic,italic,symbolgreek]{mathastext}
-
-\makeatletter
-\@for\@tempa:=a,b,c,d,e,h,i,k,l,m,n,o,q,r,s,t,u,v,w,x\do{%
-\MTsetmathskips{\@tempa}{0.5mu}{0.5mu}}%
-\makeatother
-
-\MTsetmathskips{f}{2.5mu}{0.5mu}
-\MTsetmathskips{g}{1.5mu}{0.5mu}
-\MTsetmathskips{j}{2.5mu}{0.5mu}
-\MTsetmathskips{p}{1.5mu}{0mu}
-\MTsetmathskips{y}{1.5mu}{0.5mu}
-\MTsetmathskips{z}{1mu}{0.5mu}
-
-%% ----- Basics -----
+\usepackage[margin=1in]{geometry}
 \usepackage{graphicx}
 \graphicspath{{figures/}}
 \usepackage{hyperref}
-\usepackage{subcaption}
 \usepackage{xurl}
-\usepackage{multicol}
-\usepackage{parskip}
-\usepackage{longtable}
+\usepackage{amsmath}
 \usepackage{siunitx}
-\sisetup{mode=text}   %% prevents mathastext/siunitx conflict (\mathrm undefined in XeTeX)
-\usepackage{xcolor}
-\usepackage[margin=1in]{geometry}
-\usepackage{minted}
-\usemintedstyle{fruity}
-\usepackage{listings}
-\usepackage{enumitem}
-\usepackage{wrapfig}
-\usepackage{ragged2e}
-\usepackage{array}
-\usepackage{hhline}
-\usepackage{colortbl}
-\usepackage{marginnote}
-\usepackage{emoji}
-\usepackage{tocloft}
-\usepackage{tcolorbox}
-\tcbuselibrary{skins,breakable}
-\usepackage{titlesec}
-\usepackage{titling}
 \usepackage{booktabs}
-\usepackage{tikz}
-\usetikzlibrary{positioning, calc, arrows.meta}
-\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
-\newcolumntype{R}[1]{>{\raggedleft\arraybackslash}p{#1}}
-\usepackage{pdflscape}
-\usepackage{everypage}
-\newcommand{\Lpagenumber}{%
-  \ifdim\textwidth=\linewidth\else\bgroup
-    \dimendef\margin=0
-    \ifodd\value{page}\margin=\oddsidemargin
-    \else\margin=\evensidemargin\fi
-    \raisebox{\dimexpr-\topmargin-\headheight-\headsep-0.5\linewidth}[0pt][0pt]{%
-      \rlap{\hspace{\dimexpr\margin+\textheight+\footskip}%
-      \llap{\rotatebox{90}{\thepage}}}}%
-  \egroup\fi}
-\AddEverypageHook{\Lpagenumber}
+\usepackage{longtable}
+\usepackage{listings}
 \usepackage[backend=biber,style=ieee,sorting=none]{biblatex}
 \addbibresource{refs.bib}
 
-%% ----- Equation annotations -----
-\usepackage{annotate-equations}
-
-%% ----- Body text color -----
-\let\originalnormalfont\normalfont
-\renewcommand{\normalfont}{\originalnormalfont\color{black!60}}
-
-%% ----- Headings locked to full black -----
-\titleformat{\section}{\normalfont\Large\bfseries\color{black}}{\thesection}{1em}{}
-\titleformat{\subsection}{\normalfont\large\bfseries\color{black}}{\thesubsection}{1em}{}
-\titleformat{\subsubsection}{\normalfont\normalsize\bfseries\color{black}}{\thesubsubsection}{1em}{}
-
-%% ----- Title block locked to full black -----
-\pretitle{\begin{center}\color{black}\Large\bfseries}
-\posttitle{\end{center}}
-\preauthor{\begin{center}\color{black}\normalsize}
-\postauthor{\end{center}}
-\predate{\begin{center}\color{black}\normalsize}
-\postdate{\end{center}}
-\titleformat{\paragraph}[hang]{\normalfont\normalsize\bfseries\color{black}}{\theparagraph}{1em}{}
-\titlespacing*{\paragraph}{0pt}{2ex plus 0.5ex minus 0.2ex}{0.5em}
-
-%% ----- For Code -----
-\definecolor{codegreen}{rgb}{0,0.6,0}
-\definecolor{codegray}{rgb}{0.5,0.5,0.5}
-\definecolor{codepurple}{rgb}{0.58,0,0.82}
-\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
-\lstdefinestyle{mystyle}{
-    backgroundcolor=\color{backcolour},
-    commentstyle=\color{codegreen},
-    keywordstyle=\color{magenta},
-    numberstyle=\tiny\color{codegray},
-    stringstyle=\color{codepurple},
-    basicstyle=\ttfamily\footnotesize,
-    breakatwhitespace=false,
-    breaklines=true,
-    captionpos=b,
-    keepspaces=true,
-    numbers=left,
-    numbersep=5pt,
-    showspaces=false,
-    showstringspaces=false,
-    showtabs=false,
-    tabsize=2
-}
-\lstset{style=mystyle}
-\allowdisplaybreaks
-
-%% ----- ToC settings -----
-\renewcommand{\cftsecdotsep}{\cftdotsep}
-\renewcommand{\contentsname}{}
-\renewcommand{\cftdot}{ -. }
-\renewcommand{\cftsecfont}{\color{black}}
-\renewcommand{\cftsubsecfont}{\color{black}}
-\renewcommand{\cftsecpagefont}{\color{black}}
-\renewcommand{\cftsubsecpagefont}{\color{black}}
-
-%% ----- Title Page Data -----
 \title{\textbf{__SSA_TITLE__}}
-\author{\textbf{Written and submitted by Your Name}}
-\date{\textbf{__SSA_DATE__}}
+\author{Your Name}
+\date{__SSA_DATE__}
 
 \begin{document}
 \maketitle
@@ -137,23 +32,10 @@
     \url{__OVERLEAF_READ_URL__}
 \end{center}
 
-\input{Chapters/ch1}
+\tableofcontents
+\clearpage
 
-\vspace{1em}
-\begin{tcolorbox}[
-  arc=0pt,
-  colback=white,
-  colframe=gray,
-  colbacktitle=gray,
-  coltitle=white,
-  title=DETAILS,
-  boxrule=0.5pt,
-  fonttitle=\bfseries\large,
-  breakable
-]
-\vspace{-3em}
-  \tableofcontents
-\end{tcolorbox}
+\input{Chapters/ch1}
 
 \clearpage
 \input{Chapters/ch2}
@@ -164,6 +46,5 @@
 
 \clearpage
 \input{Chapters/app_A}
-
 
 \end{document}
