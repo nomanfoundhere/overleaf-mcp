@@ -171,7 +171,7 @@ That creates `~/.overleaf-mcp/projects.json` from the example and copies the edi
 | `settings.gitToken` | Overleaf git token, used by every project (or set `OVERLEAF_GIT_TOKEN`). A per-project `gitToken` overrides it. |
 | `settings.repoDir` | Where project clones land by default (`repoDir/<name>`). A per-project `localPath` overrides it. |
 | `settings.templatesDir` | Optional. Directory of scaffold templates, overriding the bundled defaults. |
-| `settings.voiceLinter` | Optional. A prose-linter command (or set `OVERLEAF_VOICE_LINTER`) that `voice_lint` runs on a file. No default. |
+| `settings.voiceLinter` | Optional. A prose-linter command (or set `OVERLEAF_VOICE_LINTER`) that `voice_lint` runs on a file. Defaults to the bundled `examples/voice-lint.mjs`; override with your own house style. |
 | `projects.<key>.projectId` | The id from `https://www.overleaf.com/project/<ID>`. |
 | `projects.<key>.cwd` | Directory you launch the client from for this project; used to auto-detect the active project. |
 | `projects.<key>.localPath` | Explicit clone location (optional). |
@@ -293,7 +293,7 @@ By the built-in convention this parses the name, locates the parent course folde
 | `cite_lint` | Report undefined (`\cite` with no entry) and unused (entry never cited) citations. Read-only. |
 | `checkpoint` | Mark a local rollback point (a `mcp-snap/<label>` tag) before a risky edit. |
 | `restore` | Roll back to a checkpoint via a forward commit + push (no force, no history rewrite). |
-| `voice_lint` | Run a configured prose linter (`settings.voiceLinter`) on a `.tex`. Read-only, advisory. |
+| `voice_lint` | Run a prose linter on a `.tex` (the bundled `examples/voice-lint.mjs` by default; override via `settings.voiceLinter`). Lints the local working copy as-is, never pulls. Read-only, advisory. |
 
 ## How it works
 

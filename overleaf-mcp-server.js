@@ -534,8 +534,13 @@ class OverleafGitClient {
     if (!command || !command.trim()) {
       throw new Error('No voice linter configured. Set settings.voiceLinter in projects.json or the OVERLEAF_VOICE_LINTER env var (e.g. a command that takes a file path and exits non-zero on findings).');
     }
-    await this.cloneOrPull();
+    // Lint the local working copy as-is: never pulls, no network. Advisory and
+    // read-only, so it reflects on-disk state including edits not yet pushed. If
+    // the clone is absent, say so rather than silently fetching.
     const abs = path.join(this.repoPath, filePath);
+    if (!existsSync(abs)) {
+      throw new Error(`voice_lint: ${filePath} not found in the local clone (${this.repoPath}). voice_lint reads the local working copy and never pulls; open the project once (list_files / read_file) to clone it, then lint.`);
+    }
     const home = os.homedir();
     const parts = command.trim().split(/\s+/).map(t => (t.startsWith('~') ? home + t.slice(1) : t));
     const [prog, ...rest] = parts;
@@ -1194,7 +1199,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'voice_lint',
-      description: 'Lint a .tex file with a user-configured prose linter (settings.voiceLinter in projects.json, or the OVERLEAF_VOICE_LINTER env var; no default). The command receives the file path and should exit non-zero on findings. Read-only and advisory: reports output, never blocks. Useful after editing prose via edit_file/write_file, which bypass any local editor hooks.',
+      description: 'Lint a .tex file for prose issues. Runs a bundled generic example linter by default; override with settings.voiceLinter in projects.json or the OVERLEAF_VOICE_LINTER env var (a command that takes a file path and exits non-zero on findings). Lints the LOCAL working copy as-is and never pulls, so it reflects on-disk state including edits not yet pushed; if the project has not been cloned locally yet it errors rather than fetching. Read-only and advisory: reports output, never blocks. Useful after editing prose via edit_file/write_file, which bypass any local editor hooks.',
       inputSchema: {
         type: 'object',
         properties: { filePath: { type: 'string' }, projectName: { type: 'string' } },
@@ -1577,7 +1582,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'voice_lint': {
         const config = await loadConfig();
         const { client } = await getClient(args.projectName);
-        const command = config.settings?.voiceLinter || process.env.OVERLEAF_VOICE_LINTER;
+        // settings.voiceLinter / $OVERLEAF_VOICE_LINTER override the bundled
+        // example linter, which ships with the package so voice_lint works out
+        // of the box. The example implements generic prose checks; point the
+        // setting at your own command to enforce a house style.
+        const command = config.settings?.voiceLinter
+          || process.env.OVERLEAF_VOICE_LINTER
+          || `node ${path.join(PACKAGE_DIR, 'examples', 'voice-lint.mjs')}`;
         const r = await client.voiceLint(args.filePath, { command });
         return { content: [{ type: 'text', text: r.clean ? `✓ voice OK — ${args.filePath}${r.findings ? `\n${r.findings}` : ''}` : `voice findings in ${args.filePath}:\n${r.findings}` }] };
       }
