@@ -10,6 +10,16 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an 
 
 Editing a LaTeX project through an AI normally means one of two bad options: paste files back and forth by hand, or let the model overwrite whole files and hope it didn't clobber an edit you made in the browser. This server removes both. It treats Overleaf's git remote as the source of truth and gives the model **anchored edits** (replace an exact string, refuse if it moved), a **conflict gate** (a stale or concurrent change is detected, never silently overwritten), and a **build verdict** (compile from scratch, PASS only on zero errors and zero undefined references), so an editing session is safe to run unattended and provable when it's done.
 
+## Token economy
+
+Safety is one motivation; keeping a large document out of the model's context window is the other, and it drove most of the tool design. A 50 KB chapter is about 12K to 13K tokens, so the cost of a naive workflow is dominated by moving that whole file in and out.
+
+- **Anchored edits instead of whole-file rewrites.** Changing one phrase by reading the whole file and writing it back costs roughly 25K tokens per edit: the file into context, then the file back out as the write payload. `edit_file` sends only the old and new strings and returns a one-line confirmation, on the order of 100 tokens. Across a dozen edits to a single chapter that is the difference between roughly 180K tokens and 2K.
+- **A one-line build verdict instead of a raw log.** `verify_build` returns `✓ PASS — 24 pages` rather than the `latexmk` output. A raw log runs to hundreds or thousands of tokens per compile, and a multi-pass log buries the true final state under transient undefined-reference warnings from early passes (the exact trap `verify_build` classifies away by reading the final log). Over a session of repeated compiles that is a few thousand tokens against a few dozen.
+- **Section and grep reads instead of the whole file.** `get_section_content` returns one section and `search_text` returns the matching lines, so locating something costs 1K to 3K tokens rather than the full 13K.
+
+For an iterative edit, build, and review loop on a large document the tool traffic runs about an order of magnitude lighter than a read-and-rewrite-the-whole-file approach. The gain is workflow-dependent: a single full-file rewrite is a wash, since `write_file` moves the same bytes either way. It is the repeated, surgical work that compounds, which is exactly the shape of writing and revising a paper.
+
 ## Features
 
 - **Surgical, conflict-safe edits**: `edit_file` replaces an exact anchor and refuses if the region changed on Overleaf; non-overlapping concurrent edits auto-merge via git.
