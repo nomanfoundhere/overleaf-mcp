@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { resolveDataHome, synthesizeConfigFromEnv } from '../overleaf-mcp-server.js';
+import { resolveDataHome, synthesizeConfigFromEnv, mergeSettings } from '../overleaf-mcp-server.js';
+
+const HOMEDIR_M = '/home/user';
 
 const HOME = '/home/user';
 const PKG = '/opt/pkg';
@@ -75,4 +77,46 @@ test('synthesizeConfigFromEnv: OVERLEAF_PROJECT_NAME overrides the default name'
     REPOS,
   );
   assert.equal(cfg.projects.default.name, 'My Thesis');
+});
+
+// --- mergeSettings: the configure tool's merge + ~ expansion ---
+
+test('mergeSettings: only provided keys change, others preserved', () => {
+  const cur = { repoDir: '/r', academicRoot: '/a', gitToken: 'tok' };
+  const { settings, provided } = mergeSettings(cur, { ssaSubdir: 'MY SSAs' }, HOMEDIR_M);
+  assert.deepEqual(provided, ['ssaSubdir']);
+  assert.equal(settings.ssaSubdir, 'MY SSAs');
+  assert.equal(settings.repoDir, '/r');
+  assert.equal(settings.gitToken, 'tok');
+});
+
+test('mergeSettings: no args changes nothing', () => {
+  const cur = { repoDir: '/r' };
+  const { settings, provided } = mergeSettings(cur, {}, HOMEDIR_M);
+  assert.deepEqual(provided, []);
+  assert.deepEqual(settings, cur);
+});
+
+test('mergeSettings: ~ expands for path fields, not for command/name fields', () => {
+  const { settings } = mergeSettings({}, {
+    templatesDir: '~/tpl', repoDir: '~/repos', academicRoot: '~/school',
+    voiceLinter: '~/bin/lint.sh --flag', ssaSubdir: 'MY SSAs',
+  }, HOMEDIR_M);
+  assert.equal(settings.templatesDir, path.join(HOMEDIR_M, 'tpl'));
+  assert.equal(settings.repoDir, path.join(HOMEDIR_M, 'repos'));
+  assert.equal(settings.academicRoot, path.join(HOMEDIR_M, 'school'));
+  assert.equal(settings.voiceLinter, '~/bin/lint.sh --flag'); // command: left as-is
+  assert.equal(settings.ssaSubdir, 'MY SSAs');
+});
+
+test('mergeSettings: empty string clears a field (revert to bundled default)', () => {
+  const { settings, provided } = mergeSettings({ templatesDir: '/old' }, { templatesDir: '' }, HOMEDIR_M);
+  assert.deepEqual(provided, ['templatesDir']);
+  assert.equal(settings.templatesDir, '');
+});
+
+test('mergeSettings: unknown keys are ignored', () => {
+  const { settings, provided } = mergeSettings({}, { bogus: 'x', repoDir: '/r' }, HOMEDIR_M);
+  assert.deepEqual(provided, ['repoDir']);
+  assert.equal(settings.bogus, undefined);
 });

@@ -148,7 +148,7 @@ For more than one project, per-project contexts, or the SSA bootstrap, use a `pr
 npx overleaf-forge init
 ```
 
-That creates `~/.overleaf-mcp/projects.json` from the example and copies the editable templates into `~/.overleaf-mcp/templates/`. Then fill in the config:
+That creates `~/.overleaf-mcp/projects.json` from the example and copies the editable templates into `~/.overleaf-mcp/templates/`. You can fill in the settings conversationally instead of by hand: ask the assistant to set up overleaf-forge and it runs the `configure` tool (which asks where your templates, voice linter, and course folders live, then writes them). Or edit the file directly:
 
 ```json
 {
@@ -251,6 +251,7 @@ By the built-in convention this parses the name, locates the parent course folde
 
 | Tool | Purpose |
 | --- | --- |
+| `configure` | Set up the global settings conversationally: call with no arguments to see what's unset and the questions to ask, then call again with the answers. Writes `projects.json`. |
 | `get_context` | Read the writing guidelines + the active project's context. Intended first call of a session. |
 | `list_projects` | List configured projects; mark which one auto-detects from the current directory. |
 | `register_project` | Add or overwrite a project entry without hand-editing JSON. |

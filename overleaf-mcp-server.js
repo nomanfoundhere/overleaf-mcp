@@ -189,6 +189,35 @@ function resolveLocalPath(config, projectKey, project) {
   return path.join(DEFAULT_REPO_DIR, project.name || projectKey);
 }
 
+// The global settings the `configure` tool manages, each with the question to
+// ask the user when it is unset. Order is the order to ask in.
+const SETTING_HELP = {
+  repoDir:      'Where should project clones land by default? (absolute path; clones go to repoDir/<name>)',
+  academicRoot: 'Where do your course folders live? (bootstrap_ssa searches academicRoot/Year <n>/Q*/<COURSE>*)',
+  ssaSubdir:    'What subfolder name should new SSAs go under inside each course folder? (e.g. "MY SSAs")',
+  templatesDir: 'Use your own scaffold templates? Give the directory holding main.tex / context-scaffold.md (blank keeps the bundled examples).',
+  voiceLinter:  'Use your own prose linter for voice_lint? Give the command (takes a file path, exits non-zero on findings; blank keeps the bundled example).',
+  gitToken:     'Overleaf git token (prefer the OVERLEAF_GIT_TOKEN env var; set here only if you must store it in projects.json).',
+};
+const SETTING_KEYS = Object.keys(SETTING_HELP);
+const SETTING_PATHY = new Set(['repoDir', 'academicRoot', 'templatesDir']);
+
+// Merge the provided settings into the current ones, expanding a leading ~ for
+// path-like fields. Pure (homeDir injected) so it is unit-testable. Returns the
+// new settings object and the list of keys actually changed.
+export function mergeSettings(current, args, homeDir) {
+  const settings = { ...(current || {}) };
+  const provided = [];
+  for (const k of SETTING_KEYS) {
+    if (args[k] === undefined) continue;
+    let v = args[k];
+    if (typeof v === 'string' && SETTING_PATHY.has(k) && v.startsWith('~')) v = path.join(homeDir, v.slice(1));
+    settings[k] = v;
+    provided.push(k);
+  }
+  return { settings, provided };
+}
+
 // Default project resolution:
 //   1. explicit projectName argument
 //   2. project whose `cwd` is a prefix of SESSION_CWD (longest match wins)
@@ -989,6 +1018,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'configure',
+      description: 'Set up or update overleaf-forge\'s global settings: the scaffold templates directory, the voice_lint command, and the recurring-work settings bootstrap_ssa uses (academic root, SSA subdir, default clone dir). FIRST call this with NO arguments to see the current settings and which are unset, with a question for each; ask the user those questions in turn; THEN call it again with their answers to write them to projects.json. Omit a field to leave it unchanged; pass an empty string to clear it back to the bundled default. The git token is redacted in all output. Intended right after install to configure the server conversationally.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          repoDir: { type: 'string', description: 'Default clone location; clones go to repoDir/<name>. Absolute path (a leading ~ is expanded).' },
+          academicRoot: { type: 'string', description: 'Root folder bootstrap_ssa searches: academicRoot/Year <n>/Q*/<COURSE>*. Absolute path (~ expanded).' },
+          ssaSubdir: { type: 'string', description: 'Subfolder name created under each course folder for new SSAs, e.g. "MY SSAs".' },
+          templatesDir: { type: 'string', description: 'Directory of your scaffold templates (main.tex, context-scaffold.md), overriding the bundled examples. ~ expanded. Empty string reverts to bundled.' },
+          voiceLinter: { type: 'string', description: 'Prose-linter command for voice_lint (takes a file path, exits non-zero on findings), overriding the bundled example. Empty string reverts to bundled.' },
+          gitToken: { type: 'string', description: 'Overleaf git token. Prefer the OVERLEAF_GIT_TOKEN env var; set here only to store it in projects.json.' },
+        },
+      },
+    },
+    {
       name: 'register_project',
       description: 'Add or overwrite a project entry in projects.json. Lets you onboard a new Overleaf project without hand-editing JSON. Uses the global gitToken from settings. After registering, also call update_context to set the project notes.',
       inputSchema: {
@@ -1369,6 +1413,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           pushNote,
         ];
         return { content: [{ type: 'text', text: out.join('\n') }] };
+      }
+
+      case 'configure': {
+        const config = await loadConfig();
+        config.settings = config.settings || {};
+        const redact = (s) => { const r = { ...s }; if (r.gitToken) r.gitToken = '(set)'; return r; };
+        const { settings, provided } = mergeSettings(config.settings, args, os.homedir());
+
+        if (provided.length === 0) {
+          // Report mode: show current state and the questions for what is unset.
+          const unset = SETTING_KEYS.filter(k => config.settings[k] === undefined || config.settings[k] === '');
+          const lines = [
+            '# overleaf-forge configuration',
+            '',
+            'Current settings:',
+            '```json',
+            JSON.stringify(redact(config.settings), null, 2),
+            '```',
+            '',
+            unset.length
+              ? 'Not set yet. Ask the user each of these, then call configure again with their answers (omit any they want to skip):'
+              : 'All settings are set. Pass any field to update it (empty string reverts a template/linter to the bundled default).',
+            ...unset.map((k, i) => `${i + 1}. **${k}** — ${SETTING_HELP[k]}`),
+          ];
+          return { content: [{ type: 'text', text: lines.join('\n') }] };
+        }
+
+        // Apply mode: persist the provided settings.
+        config.settings = settings;
+        await saveConfig(config);
+        return { content: [{ type: 'text', text: `Updated: ${provided.join(', ')}.\n\`\`\`json\n${JSON.stringify(redact(config.settings), null, 2)}\n\`\`\`\nTakes effect on the next call (projects.json is re-read each time).` }] };
       }
 
       case 'register_project': {
