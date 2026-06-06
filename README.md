@@ -14,7 +14,18 @@ Editing a LaTeX project through an AI normally means one of two bad options: pas
 
 Safety is one motivation; keeping a large document out of the model's context window is the other, and it drove most of the tool design. A 50 KB chapter is about 12K to 13K tokens, so the cost of a naive workflow is dominated by moving that whole file in and out.
 
-- **Anchored edits instead of whole-file rewrites.** Changing one phrase by reading the whole file and writing it back costs roughly 25K tokens per edit: the file into context, then the file back out as the write payload. `edit_file` sends only the old and new strings and returns a one-line confirmation, on the order of 100 tokens. Across a dozen edits to a single chapter that is the difference between roughly 180K tokens and 2K.
+Rough token cost per operation on such a chapter, and the cut each tool buys:
+
+| Operation (on a ~50 KB chapter) | Whole-file workflow | overleaf-forge | Reduction |
+| --- | --- | --- | --- |
+| One surgical edit | ~25K (read + write the file) | ~0.15K (`edit_file`) | ~99% |
+| A dozen edits (one revision pass) | ~170K | ~3K | ~98% |
+| One compile check | ~1.5K (raw `latexmk` log) | ~0.02K (`verify_build` verdict) | ~99% |
+| Locating a passage | ~13K (read the whole file) | ~2K (`get_section_content` / `search_text`) | ~85% |
+
+Figures are order-of-magnitude, for a chapter this size; the absolute numbers scale with file size, the percentages roughly hold.
+
+- **Anchored edits instead of whole-file rewrites.** Changing one phrase by reading the whole file and writing it back costs roughly 25K tokens per edit: the file into context, then the file back out as the write payload. `edit_file` sends only the old and new strings and returns a one-line confirmation, on the order of 100 tokens. Across a dozen edits to a single chapter that is the difference between roughly 170K tokens and 3K.
 - **A one-line build verdict instead of a raw log.** `verify_build` returns `✓ PASS — 24 pages` rather than the `latexmk` output. A raw log runs to hundreds or thousands of tokens per compile, and a multi-pass log buries the true final state under transient undefined-reference warnings from early passes (the exact trap `verify_build` classifies away by reading the final log). Over a session of repeated compiles that is a few thousand tokens against a few dozen.
 - **Section and grep reads instead of the whole file.** `get_section_content` returns one section and `search_text` returns the matching lines, so locating something costs 1K to 3K tokens rather than the full 13K.
 
