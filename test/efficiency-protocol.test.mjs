@@ -1,0 +1,35 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
+
+test('fresh MCP exposes compact local tools and context version round trip',async t=>{
+ const home=await mkdtemp(path.join(os.tmpdir(),'overleaf-protocol-'));t.after(()=>rm(home,{recursive:true,force:true}));
+ const repo=path.join(home,'repo');await mkdir(path.join(repo,'.git'),{recursive:true});
+ await writeFile(path.join(repo,'main.tex'),'\\documentclass{article}\\begin{document}\\section{Intro}Hello\\end{document}');
+ await writeFile(path.join(home,'writing-guidelines.md'),'Small guide');
+ await writeFile(path.join(home,'projects.json'),JSON.stringify({settings:{gitToken:'unused'},projects:{test:{name:'Test',projectId:'test',localPath:repo}}}));
+ const client=new Client({name:'test',version:'1'});
+ await client.connect(new StdioClientTransport({command:process.execPath,args:[path.resolve('overleaf-mcp-server.js')],env:{...process.env,OVERLEAF_MCP_HOME:home},stderr:'pipe'}));
+ t.after(()=>client.close());
+ const listed=await client.listTools();assert.ok(listed.tools.some(x=>x.name==='sync_project'));
+ for (const name of ['dependency_index','change_report','render_pages','usage_stats','apply_changes','publish_changes']) assert.ok(listed.tools.some(x=>x.name===name));
+ const first=await client.callTool({name:'get_context',arguments:{projectName:'test'}});
+ const again=await client.callTool({name:'get_context',arguments:{projectName:'test',previousVersion:first.structuredContent.version}});
+ assert.equal(again.structuredContent.unchanged,true);assert.doesNotMatch(again.content[0].text,/Small guide/);
+ const b=await client.callTool({name:'get_section_bundle',arguments:{projectName:'test',filePath:'main.tex',sectionTitle:'Intro'}});assert.equal(b.isError,undefined);assert.match(b.content[0].text,/Hello/);
+ const v=await client.callTool({name:'verify_build',arguments:{projectName:'test',filePath:'main.tex',engine:'pdflatex'}});assert.match(v.content[0].text,/PASS/);assert.doesNotMatch(v.content[0].text,/Log tail|LuaHBTeX/);
+ const r=await client.callTool({name:'verify_build',arguments:{projectName:'test',filePath:'main.tex',engine:'pdflatex'}});assert.match(r.content[0].text,/Reused verification: true/);
+ await writeFile(path.join(repo,'.latexmkrc'),'die "Project rc must not execute in controlled mode";\n');
+ const controlled=await client.callTool({name:'verify_build',arguments:{projectName:'test',filePath:'main.tex',engine:'pdflatex',controlled:true}});
+ assert.equal(controlled.structuredContent.pass,true);assert.equal(controlled.structuredContent.cacheEligible,true);
+ const reused=await client.callTool({name:'verify_build',arguments:{projectName:'test',filePath:'main.tex',engine:'pdflatex',controlled:true}});assert.equal(reused.structuredContent.reused,true);
+ const report=await client.callTool({name:'change_report',arguments:{projectName:'test'}});assert.ok(report.structuredContent.version);
+ const index=await client.callTool({name:'dependency_index',arguments:{projectName:'test'}});assert.ok(index.structuredContent.files.length);
+ const rendered=await client.callTool({name:'render_pages',arguments:{projectName:'test',filePath:'main.pdf',pages:[1]}});assert.equal(rendered.structuredContent.files.length,1);
+ const againRendered=await client.callTool({name:'render_pages',arguments:{projectName:'test',filePath:'main.pdf',pages:[1]}});assert.equal(againRendered.structuredContent.cacheHits,1);
+ const stats=await client.callTool({name:'usage_stats',arguments:{}});assert.ok(stats.structuredContent.cacheHits>=4);assert.ok(stats.structuredContent.responseBytes>0);
+});

@@ -12,11 +12,16 @@ const git = (cwd, a) => execFile('git', ['-C', cwd, ...a]);
 function client(r) {
   return new OverleafGitClient('test', 'tok', clientClonePath(r.root), r.remote);
 }
+async function localClient(r) {
+  const c = client(r);
+  await c.cloneOrPull();
+  return c;
+}
 
 test('getBlobSha returns a stable 40-hex sha for an existing file', async () => {
   const r = await makeRemote({ 'main.tex': 'hello\n' });
   after(() => r.cleanup());
-  const c = client(r);
+  const c = await localClient(r);
   const sha = await c.getBlobSha('main.tex');
   assert.match(sha, /^[0-9a-f]{40}$/);
   assert.equal(sha, await c.getBlobSha('main.tex')); // stable when unchanged
@@ -25,7 +30,7 @@ test('getBlobSha returns a stable 40-hex sha for an existing file', async () => 
 test('getBlobSha returns null for a missing file', async () => {
   const r = await makeRemote();
   after(() => r.cleanup());
-  assert.equal(await client(r).getBlobSha('nope.tex'), null);
+  assert.equal(await (await localClient(r)).getBlobSha('nope.tex'), null);
 });
 
 // Build a local commit that diverges from the remote, then push a remote commit,
@@ -41,7 +46,7 @@ async function diverge(r, c, { localFile, localBody, remoteFile, remoteBody }) {
 test('_pushWithMerge auto-merges a non-overlapping divergence', async () => {
   const r = await makeRemote({ 'a.tex': 'A\n', 'b.tex': 'B\n' });
   after(() => r.cleanup());
-  const c = client(r);
+  const c = await localClient(r);
   await diverge(r, c, { localFile: 'a.tex', localBody: 'A-local\n', remoteFile: 'b.tex', remoteBody: 'B-remote\n' });
   await c._pushWithMerge();
   await c.cloneOrPull();
@@ -52,7 +57,7 @@ test('_pushWithMerge auto-merges a non-overlapping divergence', async () => {
 test('_pushWithMerge refuses + resets clean on an overlapping divergence', async () => {
   const r = await makeRemote({ 'a.tex': 'line\n' });
   after(() => r.cleanup());
-  const c = client(r);
+  const c = await localClient(r);
   await diverge(r, c, { localFile: 'a.tex', localBody: 'local\n', remoteFile: 'a.tex', remoteBody: 'remote\n' });
   await assert.rejects(() => c._pushWithMerge(), /conflict/i);
   const { stdout } = await git(c.repoPath, ['status', '--porcelain']);
@@ -112,7 +117,7 @@ test('writeFile creates a new file freely', async () => {
 test('writeFile overwrites an existing file when baseSha matches', async () => {
   const r = await makeRemote({ 'main.tex': 'one\n' });
   after(() => r.cleanup());
-  const c = client(r);
+  const c = await localClient(r);
   const base = await c.getBlobSha('main.tex');
   const res = await c.writeFile('main.tex', 'two\n', { baseSha: base });
   assert.equal(res.pushed, true);
@@ -122,7 +127,7 @@ test('writeFile overwrites an existing file when baseSha matches', async () => {
 test('writeFile refuses a stale baseSha (file changed on Overleaf)', async () => {
   const r = await makeRemote({ 'main.tex': 'one\n' });
   after(() => r.cleanup());
-  const c = client(r);
+  const c = await localClient(r);
   const stale = await c.getBlobSha('main.tex');
   await r.remoteEdit('main.tex', 'edited-on-overleaf\n');
   await assert.rejects(() => c.writeFile('main.tex', 'two\n', { baseSha: stale }), /changed on Overleaf|stale/i);

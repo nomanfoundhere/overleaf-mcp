@@ -1,245 +1,45 @@
-# Overleaf Writing Guidelines
+# Overleaf workflow
 
-This file is read on every `get_context` call. It is the single source of truth for **LaTeX mechanics, SSA structure, and enforcement**. Authorial voice rules live in the user's global `CLAUDE.md` — this file deliberately does not duplicate them. If you are not certain you have read `CLAUDE.md` already this session, stop and read it before writing prose.
+This short guide is loaded by `get_context`. Apply the user's current instructions and existing project template.
 
----
+## Personal overrides
 
-## 0. Pre-flight — read before any edit
+This is the bundled generic guide. Place a `writing-guidelines.local.md` in the data home to replace it with personal rules (voice, house style, template conventions); that file is gitignored and read in preference to this one on every `get_context` call. Detailed personal references can sit beside it in a gitignored `references.local/` and be pointed to from the local guide.
 
-Before drafting or modifying any `.tex`:
+Call `get_context` with the explicit project key when establishing the project in a session. Confirm the returned identity. Reuse guidance already read while it remains available and unchanged; do not also read the same file separately. Check file modification time or a content hash if freshness is uncertain. Reload affected guidance after a change, a project switch or lost context. Pass the returned `version` as `previousVersion` on a later `get_context` call: unchanged context returns a compact response. Changed context returns the updated body.
 
-1. Call `get_context` for the active project (it autodetects from CWD; no need to pass `projectName`).
-2. Call `status_summary` and skim what already exists. Read the surrounding section with `get_section_content` rather than guessing.
-3. Read `refs.bib` if you intend to cite. New citations need a `refs.bib` entry — do not invent `\cite{}` keys.
-4. If preamble or package availability is in doubt, read the project's `main.tex` preamble before adding any `\usepackage{}` or environment.
+Keep project-specific context focused on constraints, sources, decisions and unresolved questions. Do not copy the shared rules into each project context or expand durable context files without authorization.
 
-Skipping this step is the most common cause of "Claude wrote good-looking LaTeX that doesn't build."
+## Small-edit workflow
 
----
+Synchronize once at the start only when remote changes matter. Afterwards, `list_files`, `read_file`, `get_sections`, `get_section_content`, `search_text`, `cite_lint`, `get_section_bundle`, the dependency tools and builds read the existing local clone only. They never pull, so a focused read cannot overwrite local work or spend a network round trip. A missing clone is an explicit `sync_project` task.
 
-## 1. End-of-write enforcement checklist
+Read the target section and enough surrounding text to understand it, make the edit, check affected claims and rendered pages, run one final verification, then publish only when separately authorized. A wording edit stays within wording and its supporting claims. Do not expand it into a design review unless the requested edit changes a technical claim or exposes a concrete inconsistency; explain that dependency before broadening work. A front-matter edit normally starts with that file and the evidence supporting its changed claims, not the entire document archive. Broaden inspection when a changed value, label, assumption or shared component has downstream users.
 
-**Before declaring a writing task complete, walk this list literally.** Do not paraphrase, do not skim — read each item and check the file.
+Preserve the template, preamble and unrelated edits. Inspect the bibliography entries used by new or changed claims rather than repeatedly dumping the whole bibliography. Read source support before adding a claim; reuse already verified stable evidence when it still supports the wording. Refresh time-sensitive facts as needed. Never infer that an unread source supports a claim.
 
-- [ ] **Em-dashes:** zero `—` characters in the prose (search the file). Replace with comma, parenthesis, colon, or sentence break. (Exception: none. The rule has no exceptions in this project.)
-- [ ] **`\autoref{}` everywhere:** zero bare `\ref{}` or `\pageref{}` in the file. Cross-refs use `\autoref{}`. The preamble loads `hyperref` for this — there is no excuse.
-- [ ] **All tables are `longtable`.** No bare `tabular`, no `tabularx`. Header row repeats via `\endhead`.
-- [ ] **Display math:** no `\[ ... \]`. Only `equation`, `align`, `gather`, or `multline`. `\allowdisplaybreaks` is on globally — do not add it locally.
-- [ ] **No math-mode font commands:** no `\mathrm`, `\mathbf`, `\mathit`, `\mathsf`, `\mathcal` unless absolutely required for disambiguation (and even then prefer `siunitx`).
-- [ ] **`siunitx` for units:** no `m/s`, no `kg`, no `\%` typed by hand next to numbers. Use `\SI{}{}` and `\si{}`.
-- [ ] **No `\emph`, no `\\` for spacing, no `\newline`.** Use `\vspace{}` / structure instead.
-- [ ] **Every non-trivial number is interpreted in the sentence that contains it** (see SSA rules below).
-- [ ] **Every factual claim that isn't common knowledge has a `\cite{}`** and a matching `refs.bib` entry. No raw URLs in the prose.
-- [ ] **`compile_file` succeeds.** Run it on the project entrypoint (usually `main.tex`). If it fails, fix and re-run before reporting done. A successful diff is not the same as a successful build.
-- [ ] **Voice check against CLAUDE.md** — re-read the "Phrases to avoid wholesale" list and grep for them in your changes.
+## One final verification gate
 
-This checklist exists because the rules below get skimmed. Run it.
+Batch a coherent set of edits before building. Compile during editing when needed to resolve a layout question, a compilation failure or another concrete uncertainty. Avoid automatically running `compile_file` immediately before `verify_build`: the latter compiles too. A successful final `verify_build` on the latest source satisfies the compilation gate. A local LuaLaTeX build plus equivalent log checks is the fallback when MCP verification is unavailable.
 
----
+Require a produced PDF, zero LaTeX errors, zero undefined citations/references and no newly introduced overfull/underfull boxes. Report page count. Re-run after changes that invalidate the successful check, not merely because another step in a checklist also says to build. Build tools operate locally without pulling. Call `sync_project` explicitly when remote changes are needed. `verify_build` reuses eligible unchanged success results, while `force: true` requests a rebuild. Executable configuration or incomplete dependency tracking disables reuse; a fresh build may clean auxiliary files. Preserve concurrent user edits and use the verified project/branch.
 
-## 2. LaTeX mechanics
+`controlled: true` is an opt-in reproducible-build mode. It runs `latexmk -norc -no-shell-escape`, so project rc files cannot affect the result. Declare any necessary regular external files through absolute `externalInputs`; their content hashes enter the cache key. Do not enable it for projects that require `minted`, shell escape, Lua file access or their rc file. Those features remain ineligible for cached reuse.
 
-### 2.1 Engine and preamble
+Inspect changed PDF pages and their neighbours. Expand review when pagination changes affect subsequent layout, or when shared fonts, macros, numbering, contents, bibliography or figures change. Number-only page shifts do not alone require re-reading all unchanged prose. Check the latest rendered result, not an earlier screenshot.
 
-- **Engine:** LuaLaTeX. Required for `plex-otf` and `emoji`. Do not switch engines without being asked.
-- **Font:** IBM Plex Sans via `plex-otf`, sans-serif default family.
-- The canonical full main.tex (preamble + title block + Chapters input + tcolorbox-wrapped ToC + bibliography + appendix) lives in `templates/main.tex`. **Read it before adding any new package or environment.** Do not rebuild from memory and do not reorder preamble blocks — package order is load-bearing (e.g. `hyperref` must load before `cleveref`, `mathastext` before `siunitx`).
-- The preamble already includes `\allowdisplaybreaks`. All equations break across pages by default — never add it locally.
-- The preamble already loads `hyperref`, so `\autoref{}` is available everywhere. There is never a reason to use `\ref{}`.
-- The preamble already loads `longtable`. Use `longtable` for any multi-row data table — even short ones — so future row additions don't require switching environments.
+## Delegation and reusable diagrams
 
-### 2.2 Section structure and ToC
+When delegation is authorized and worth its overhead, give lighter agents bounded extraction, inventory or comparison tasks with specific files and compact outputs. Give them only the relevant context. Keep ambiguous physical design, critical derivations and judgment-heavy figure work with the primary agent unless a clear independent assignment justifies delegation. Do not create an agent merely to reread an already understood section. If repeated corrections erase the benefit, finish the task locally.
 
-- `\section{}` — main chapters.
-- `\subsection{}` — major divisions.
-- `\subsubsection{}` — minor divisions.
-- `\paragraph{}` — named items inside a section (categories, design options, listed configurations). These appear in the ToC and give an at-a-glance view of contents. The SSA1 thermal-storage section is the model.
-- Do not go deeper than `\paragraph` unless strictly necessary.
-- The ToC must be readable as a standalone outline of what the document contains. If your ToC reads as a generic skeleton ("Introduction / Method / Results / Conclusion"), the document is under-structured.
+Before creating a diagram generator, inspect existing project figures and scripts. Reuse their established geometry, colours, notation and layout helpers where appropriate. Derive geometry from parameters and verify connections, directions, scale and label readability. Do not force an unsuitable old diagram onto a new mechanism or create a general graphics framework for a single figure.
 
-### 2.3 Cross-references
+## Compact evidence and stopping conditions
 
-- Always `\autoref{}`. Never bare `\ref{}` or `\pageref{}`.
-- Label conventions: `sec:`, `fig:`, `tab:`, `eq:`, `app:`. Be consistent within a document.
+Use `get_section_bundle` for a local section plus its directly referenced equation/figure blocks, citation entries and asset paths. Use `dependency_index` when changed labels, values, citations or included files may affect other sections. It reports static links and unresolved dynamic constructs. Use `change_report` with its previous version to narrow the next read. Use `render_pages` with explicit page numbers to reuse a locally cached render of an unchanged PDF page. Inspect unresolved references and truncation flags; these tools are not recursive TeX interpreters.
 
-### 2.4 Math
+For a coherent multi-file edit, first read each file's `baseRevision` and `contentHash`, then call `apply_changes`. It checks every input hash, verifies the complete candidate once in an isolated worktree and fast-forwards one local commit only on success. It handles UTF-8 source files, not binary assets. `publish_changes` separately re-verifies the exact clean revision and pushes it once when publication is authorized. It never pulls, merges, resets or retries a publish. Resolve a stale-source or conflict error with a fresh focused read rather than repeating the same request.
 
-- Inline: `$ ... $`.
-- Display: `equation`, `align`, `gather`, `multline`. Never `\[ \]`.
-- No math-mode font commands (`\mathrm`, `\mathbf`, `\mathit`, `\mathsf`, …). Variables stay in default math italic.
-- Use `annotate-equations` to label variables on **first introduction** of an equation, and to annotate non-obvious steps (a substitution, a change of variable, a physical interpretation). Do **not** annotate trivial algebra.
-- Symbol consistency: pick a symbol per quantity at the start of the document and do not redefine it. If you must reuse a letter, declare scope explicitly.
+Build tools return compact verdicts and log paths by default; `verbose: true` adds a bounded tail. `usage_stats` reports in-process call counts, response bytes, durations and cache hits without recording document text. Response bytes are a comparison signal, not a billing estimate. Structured errors give a suggested next action and always declare zero automatic retries. Request focused search results, changed values, concise diffs and build verdicts. Keep full logs on disk; bring relevant error context into the conversation when needed. Batch independent reads and checks, inspect every result, and keep dependent edits and approvals sequential. Use reasonable polling intervals instead of repeated short waits.
 
-### 2.5 Text formatting
-
-- `\textbf{}`, `\textit{}`, `\texttt{}` allowed but sparingly. Reshape the sentence before reaching for `\textbf{}`.
-- File names, paths, variable names, code inline: `\verb|...|` or `\texttt{}`.
-- No `\emph{}` — italic does not sit well with the sans font.
-
-### 2.6 Spacing and breaks
-
-- No `\newline`, no `\\` for spacing in prose. Use `\vspace{}`, `\parskip`, or proper structure.
-- Use `\noindent` only when typographically necessary, not as a habit.
-
-### 2.7 Citations
-
-- `biblatex` with `style=ieee` and `backend=biber`. Cite with `\cite{}`.
-- Numeric, ordered by appearance.
-- Every non-obvious factual claim needs a citation.
-- Cite the primary source. If a textbook cites a paper, cite the paper.
-- No raw URLs in prose. URLs live only in the `refs.bib` entry.
-
-### 2.8 Code
-
-- `minted` with `style=fruity`.
-- Short focused snippets in the body when explaining code line-by-line; the full script goes in the appendix and is referenced with `\autoref{app:...}`.
-- Do not paste entire files into the main flow. If a snippet runs longer than ~25 lines, ask whether it should be appendix-shaped.
-
-### 2.9 Figures
-
-- Captions below figures (`\caption` after `\includegraphics`).
-- Place images near the referencing text. Do not force floats far from context.
-- Subfigures via `subcaption` package when needed.
-- PDF-page extracts (slide screenshots, report pages used as figures) wrap in `\fbox{}` to frame them as external documents.
-- Photographs, diagrams, plots: no `\fbox{}`.
-- Every figure is referenced from the prose with `\autoref{}` and is interpreted, not just shown.
-
-### 2.10 Tables
-
-- **Default environment is `longtable`.** Not `tabular`, not `tabularx`. Even a three-row table goes in `longtable` so a later row addition does not force an environment swap. The preamble already loads it and configures page-breaking.
-- `booktabs` rules (`\toprule`, `\midrule`, `\bottomrule`). No vertical rules.
-- Header row is repeated on every page with `\endfirsthead` / `\endhead`. Skipping this on a `longtable` means the second-page rows appear with no column labels — wrong, even when the table happens to fit on one page in the current draft.
-- Numbers align by decimal where it aids comparison (`siunitx` `S` column).
-
-### 2.11 Units and quantities
-
-- All physical quantities in prose, math, captions, and tables go through `siunitx`. No hand-typed `kg/s`, no `100\,\mathrm{W}`.
-- Use `\num{}` for bare numbers that need formatting (thousands separators).
-
-### 2.12 `tcolorbox`
-
-- Use for callouts, notes, highlighted derivations.
-- Always include `breakable` so boxes split across pages.
-
-### 2.13 Appendices
-
-- Long tables and full code listings live in the appendix.
-- Reference each appendix item from the main text with `\autoref{}`. An appendix that is never referenced is dead weight — either reference it or cut it.
-
----
-
-## 3. SSA writing style
-
-**Applies to any project whose name contains "SSA". These rules override the general register when they conflict.** Voice rules in CLAUDE.md generally agree with what follows, with the explicit exception that first-person is allowed and expected here (CLAUDE.md flags this as the SSA exception).
-
-### 3.1 Voice and person
-
-First person throughout: "I did X", "I wrote Y", "I felt Z". When work was genuinely collaborative, name people and say who did what. Do not absorb others' contributions into "we" and do not undersell your own. Informal but substantive: "I reckon", "basically", "sort of", "in my view", "I guess" carry meaning about confidence and framing — do not suppress them. If something surprised you, or an approach was scrapped, say so and say why.
-
-### 3.2 Directness
-
-Lead with the finding, then explain. Do not build to a reveal. "Thermal storage is eliminated. Three independent arguments support this, each sufficient on its own" is the model — not three paragraphs of build-up landing on "therefore, thermal storage is eliminated." Especially in Details sections. Exception: derivations and process-heavy sections (CAD, coding, collaborative analysis) are naturally chronological and should stay that way.
-
-### 3.3 Hedging
-
-Natural hedging is welcome — "in practice", "roughly", "in principle", "at the time". Informal hedges ("I think", "tbh", "lowkey", "I reckon", "I feel that") are OK in process narration, transitions, and meta-commentary. They must vanish when you make a technical claim or run a formal argument. Never "I think the greedy policy might be optimal" — write "the greedy policy is provably optimal for a lossless store." Flag unexpected results explicitly: "Perhaps the core idea still works, but at the very least this specific configuration is probably not tenable."
-
-### 3.4 Intuition before formalism
-
-For any non-trivial concept, give the intuitive picture first, then the formal version. Not optional. The intuitive version should stand alone for someone skipping the maths. Then, if needed: "Formal argument." Never present a derivation or result without first explaining what it captures physically or geometrically.
-
-### 3.5 Process transparency
-
-The Summary especially should document how the work actually happened, including course corrections. "At the time, the plan was X. After the Wednesday meeting, Z was locked in" is exactly right. Do not sand the narrative into a clean linear story when reality was not linear. Show reasoning, not just conclusions. Cross-reference other SSAs explicitly by number: "Going back to SSA 3...", "Building on SSA 4...". Cross-reference figures with page numbers in long documents: "as seen in Figure 3 on pg. 5". It is fine to flag unfinished work at submission and to flag known bugs openly.
-
-### 3.6 Motivation before method
-
-WHY before HOW. "Since the first deadline was tight, I did most of this before the first meeting" tells the reader something. "I did the analysis in Python" without context tells them nothing. The reader must understand the design goal or problem before the method appears.
-
-### 3.7 Numbers need immediate interpretation
-
-Never leave a number dangling. Every figure is followed in the same sentence (or the next clause) by what it means in context: "74.8 GWh, clearly not realistic at any real scale"; "284.8 hours, which immediately rules out any technology limited to daily or weekly cycling." The number and its implication are one unit. Applies to derived quantities, experimental results, and design parameters alike.
-
-### 3.8 Parenthetical asides
-
-Natural parenthetical commentary, including informal practical remarks, is welcome. "(Uploading 417 charts individually wasn't working out so I used Claude to package it)" is the right register for the Summary. These ground the document in what actually happened.
-
-### 3.9 Internal cross-referencing
-
-Reference earlier sections when building on them. Do not re-derive, point back. "The six-month deficit established in Section 1" is fine and expected. The same holds across a series: "Going back to the analysis in an earlier SSA..."
-
-### 3.10 Meta-commentary
-
-Flagging why a section exists, what changed partway through, or what a result does or does not imply is a legitimate move: "A note on the utility of this section: by the time this was written, we had already decided on pumped hydro — but documenting the thermal storage reasoning is likely useful for future deliverables." Flag your own bugs and unresolved issues rather than hiding them.
-
-### 3.11 Section-specific tone
-
-- **Goals** — bullet points only. Outcome-oriented and precise. One sentence per goal. No padding.
-- **Summary** — narrative, roughly chronological, reads like a lab notebook written by someone who can write. Dense but connected paragraphs. Documents how work actually unfolded, including pivots.
-- **Conclusion / Recommendation** — tight. Lead with the recommendation or key result. No preamble. Numbers with context. Trade-offs stated plainly.
-- **Problems Faced** — genuinely honest. If something was hard, say specifically what and why. "The derivation was difficult and tedious." "I ran out of time before finishing the implementation." "No significant problems were faced" is acceptable when true — but do not invent problems and do not sanitise real ones.
-- **Future Work** — forward-looking and practical. Specific, not vague: not "refine the design" but "export as .dxf and .3mf, check the full assembly with the cart, make changes if necessary." May include work that was supposed to be in this SSA but was not finished, and things unrelated to the main topic.
-- **Details / Content sections** — technical but readable. Always interpret figures and tables after presenting them. Never let a result sit without commentary. Process narration ("I first tried X, then messaged Y, and we concluded Z") is documentation, not padding.
-
-### 3.12 References and citations (SSA)
-
-All sources — papers, books, datasheets, Wikipedia, YouTube videos — go in `refs.bib` and are cited with `\cite{}`, appearing as `[1]`, `[2]`, etc. Never paste raw URLs into prose. The URL may appear in the bibliography entry but not in the running text. Every non-obvious factual claim needs a citation. Wikipedia is acceptable for definitions and overviews. Cite primary sources where available.
-
----
-
-## 4. Common failure modes (negative examples)
-
-### 4.1 AI-voice leaking in
-
-Bad — generic AI register:
-
-> It is important to note that thermal storage offers a number of significant advantages. Furthermore, this technology has been shown to play a key role in modern energy systems, highlighting its potential to revolutionize the field.
-
-Why it is bad: "It is important to note", "a number of", "furthermore", "play a key role", "highlighting", "revolutionize" — every phrase is from the CLAUDE.md "phrases to avoid" list. Awe-marker stacking, no content.
-
-Good — same point, SSA register:
-
-> Thermal storage looked viable on paper: high round-trip efficiency at the scales documented in [3], and a low marginal cost above ~50 MWh. The first deadline made testing this in detail tight, and by the Wednesday meeting it was clear the cycling profile we actually needed (sub-daily, partial-state) was outside the operating envelope of every candidate in [3]–[5]. That is what eliminated it.
-
-### 4.2 Number dangling
-
-Bad:
-
-> The system achieves 74.8 GWh of storage. This is a large value.
-
-Good:
-
-> The system would require 74.8 GWh of storage — roughly the daily consumption of a mid-sized European city, clearly not realistic at any real scale.
-
-### 4.3 LaTeX that compiles but is wrong-shape
-
-Bad:
-
-```latex
-The result is \mathbf{x} = 12.4 m/s as shown in Ref. \ref{fig:result}.
-\[ y = \alpha x + \beta \]
-```
-
-Wrong on four counts: `\mathbf{}`, hand-typed units, bare `\ref{}` (and "Ref." prefix), `\[ \]`. Correct form:
-
-```latex
-The result is $x = \SI{12.4}{\meter\per\second}$ as shown in \autoref{fig:result}.
-\begin{equation}
-  y = \alpha x + \beta
-  \label{eq:linear-model}
-\end{equation}
-```
-
-### 4.4 Build broke and nobody noticed
-
-If `compile_file` returned anything other than `✓ PDF written to ...`, the task is not done. Do not paper over a missing package or undefined reference by silently removing the line that triggered it — fix the underlying cause (missing `\usepackage{}`, missing `\label{}`, missing `refs.bib` entry).
-
----
-
-## 5. When you are unsure
-
-- Re-read this file (`get_context`) rather than guessing.
-- Read the surrounding section before editing it.
-- Read the preamble before adding a package.
-- Run `compile_file` after every meaningful change, not only at the end.
-- If a rule here conflicts with something the user just said in conversation, the user's most recent instruction wins — but flag the conflict explicitly so they can confirm.
+Stop verification when the latest edit passes its relevant checks and no unresolved concern calls for another pass. Preserve source checks for new claims, independent checks of consequential calculations and visual review of changed diagrams. Usage savings must not come from hiding uncertainty, skipping these checks or claiming unmeasured savings. Existing publication authorization persists; do not infer new authorization from this workflow.

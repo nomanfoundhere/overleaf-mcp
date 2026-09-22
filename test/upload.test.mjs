@@ -11,6 +11,7 @@ import { makeRemote, clientClonePath, readFromRemote } from './helpers.mjs';
 const execFile = promisify(ef);
 const git = (cwd, a) => execFile('git', ['-C', cwd, ...a]);
 function client(r) { return new OverleafGitClient('test', 'tok', clientClonePath(r.root), r.remote); }
+async function localClient(r) { const c = client(r); await c.cloneOrPull(); return c; }
 
 const PNG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff]; // PNG magic + null + 0xff (not valid UTF-8)
 
@@ -25,7 +26,7 @@ async function tmpBinary(bytes) {
 test('uploadFile lands bytes identical in the pushed remote', async () => {
   const r = await makeRemote({ 'main.tex': 'm\n' });
   after(() => r.cleanup());
-  const c = client(r);
+  const c = await localClient(r);
   const { p, buf } = await tmpBinary(PNG);
   const res = await c.uploadFile({ srcPath: p, destPath: 'figures/fig1.png' });
   assert.equal(res.pushed, true);
@@ -63,7 +64,7 @@ test('uploadFile overwrites with overwrite:true', async () => {
 test('uploadFile refuses a stale baseSha in single mode', async () => {
   const r = await makeRemote({ 'figures/x.png': 'old' });
   after(() => r.cleanup());
-  const c = client(r);
+  const c = await localClient(r);
   const stale = await c.getBlobSha('figures/x.png');
   await r.remoteEdit('figures/x.png', 'changed-on-overleaf');
   const { p } = await tmpBinary(PNG);

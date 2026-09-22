@@ -64,6 +64,7 @@ test('verifyBuild PASSes a trivial doc (integration; skipped without latexmk)', 
   const r = await makeRemote({ 'main.tex': TRIVIAL });
   after(() => r.cleanup());
   const c = new OverleafGitClient('test', 'tok', clientClonePath(r.root), r.remote);
+  await c.cloneOrPull();
   const v = await c.verifyBuild('main.tex', 'pdflatex');
   assert.equal(v.pass, true);
   assert.ok(v.pageCount >= 1);
@@ -75,6 +76,7 @@ test('verifyBuild PASSes a doc with a cross-ref (final-pass log, not first-pass 
   const r = await makeRemote({ 'main.tex': REFDOC });
   after(() => r.cleanup());
   const c = new OverleafGitClient('test', 'tok', clientClonePath(r.root), r.remote);
+  await c.cloneOrPull();
   const v = await c.verifyBuild('main.tex', 'pdflatex');
   assert.equal(v.pass, true, `expected PASS but undefinedRefs=${v.undefinedRefs.length}`);
   assert.deepEqual(v.undefinedRefs, []);

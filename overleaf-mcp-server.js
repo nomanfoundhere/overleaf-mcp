@@ -13,6 +13,14 @@ import { execFile as execFileCallback } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
+import { createHash } from 'node:crypto';
+import { dependencyIndex, changeReport } from './dependency-index.js';
+import { renderPages } from './render-cache.js';
+import { applyChanges, publishChanges } from './transactions.js';
+import { observeTool, usageStats, toolError } from './runtime-observability.js';
+import { versionedContext, buildFingerprint, sectionBundle, controlledBuildOptions } from './efficiency.js';
+const verifiedBuilds = new Map();
+const buildQueues = new Map();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -85,10 +93,20 @@ const CONFIG_PATH = path.join(DATA_HOME, 'projects.json');
 const CONTEXTS_DIR = path.join(DATA_HOME, 'contexts');
 const DEFAULT_REPO_DIR = path.join(DATA_HOME, 'repos');
 const BUNDLED_TEMPLATES_DIR = path.join(PACKAGE_DIR, 'templates');
-// A user copy in the data home overrides the bundled default writing-guidelines.
-const GUIDELINES_PATH = existsSync(path.join(DATA_HOME, 'writing-guidelines.md'))
-  ? path.join(DATA_HOME, 'writing-guidelines.md')
-  : path.join(PACKAGE_DIR, 'writing-guidelines.md');
+// Guidelines resolve personal-first:
+//   1. <dataHome>/writing-guidelines.local.md  (gitignored; never ships)
+//   2. <dataHome>/writing-guidelines.md        (user copy, when dataHome is not the package)
+//   3. <packageDir>/writing-guidelines.md      (bundled generic default)
+// The .local name is what keeps a personal copy distinct when dataHome IS the
+// package dir (a local clone with projects.json), where 2 and 3 are one file.
+// Resolved per call so creating or deleting the local file needs no restart.
+export function resolveGuidelinesPath({ dataHome, packageDir, exists }) {
+  const local = path.join(dataHome, 'writing-guidelines.local.md');
+  if (exists(local)) return local;
+  const user = path.join(dataHome, 'writing-guidelines.md');
+  if (exists(user)) return user;
+  return path.join(packageDir, 'writing-guidelines.md');
+}
 
 // Where scaffold templates (main.tex skeleton, context-scaffold.md) are read.
 // Precedence: settings.templatesDir → $OVERLEAF_MCP_TEMPLATES → ~/.overleaf-mcp/
@@ -321,23 +339,16 @@ class OverleafGitClient {
     }
     // Repair older clones that embedded the token in the remote URL.
     await this._git(['-C', this.repoPath, 'remote', 'set-url', 'origin', this.gitUrl]).catch(() => {});
-    try {
-      const { stdout } = await this._git(['-C', this.repoPath, 'pull', '--ff-only'], { auth: true });
-      return stdout;
-    } catch {
-      // Pull failed (diverged, or leftover changes from a prior failed write).
-      // Overleaf is the source of truth, so fetch and hard-reset to the remote
-      // tip rather than cascading into a clone-into-nonempty-dir error.
-      await this._git(['-C', this.repoPath, 'fetch', 'origin'], { auth: true });
-      const { stdout: br } = await this._git(['-C', this.repoPath, 'rev-parse', '--abbrev-ref', 'HEAD']);
-      const branch = (br || '').trim() || 'master';
-      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]);
-      return `recovered: hard-reset to origin/${branch}`;
-    }
+    const { stdout } = await this._git(['-C', this.repoPath, 'pull', '--ff-only'], { auth: true });
+    return stdout;
+  }
+
+  async requireLocal() {
+    if (!(await this._hasRepo())) throw Object.assign(new Error('Local clone missing; call sync_project explicitly.'), { code: 'LOCAL_CLONE_MISSING' });
   }
 
   async listFiles(extension = '.tex') {
-    await this.cloneOrPull();
+    await this.requireLocal();
     const out = [];
     const walk = async (dir) => {
       const entries = await readdir(dir, { withFileTypes: true });
@@ -355,14 +366,16 @@ class OverleafGitClient {
   }
 
   async readFile(filePath) {
-    await this.cloneOrPull();
-    const fullPath = path.join(this.repoPath, filePath);
+    await this.requireLocal();
+    const root = realpathSync(this.repoPath);
+    const fullPath = realpathSync(path.resolve(root, filePath));
+    if (!fullPath.startsWith(root + path.sep)) throw Object.assign(new Error('File must be inside the project.'), { code: 'INVALID_INPUT' });
     return await readFile(fullPath, 'utf-8');
   }
 
   // git blob SHA of a file at the current tip; null if the file isn't tracked.
-  async getBlobSha(filePath, { pull = true } = {}) {
-    if (pull) await this.cloneOrPull();
+  async getBlobSha(filePath) {
+    await this.requireLocal();
     try {
       const { stdout } = await this._git(['-C', this.repoPath, 'rev-parse', `HEAD:${filePath}`]);
       return stdout.trim();
@@ -387,63 +400,85 @@ class OverleafGitClient {
   // Run latexmk from the repo root (so the project's .latexmkrc -- shell-escape,
   // the python@3.13 PATH fix for minted, $pdf_mode -- applies, and refs/citations/
   // reruns resolve). clean:true adds -gg to force a complete from-scratch rebuild.
-  async _runLatexmk(filePath, engine = 'lualatex', { clean = false } = {}) {
-    await this.cloneOrPull();
+  async _runLatexmk(filePath, engine = 'lualatex', { clean = false, controlled = false } = {}) {
+    const full = path.resolve(this.repoPath, filePath);
+    if (!full.startsWith(path.resolve(this.repoPath) + path.sep) || !filePath.endsWith('.tex') || filePath.startsWith('-')) throw new Error('Build entrypoint must be a .tex path inside the project.');
+    if (!(await this._hasRepo())) throw new Error('Local clone missing; call sync_project explicitly before building.');
     const engineFlag = { pdflatex: '-pdf', xelatex: '-xelatex', lualatex: '-lualatex' }[engine];
     if (!engineFlag) {
       throw new Error(`Invalid engine "${engine}". Choose from: pdflatex, xelatex, lualatex`);
     }
     const texbin = '/Library/TeX/texbin';
     const env = { ...process.env, PATH: `${texbin}:${process.env.PATH || ''}` };
-    const args = [engineFlag, '-interaction=nonstopmode', '-halt-on-error'];
+    const args = [engineFlag, '-interaction=nonstopmode', '-halt-on-error', '-recorder'];
+    // -norc must precede all other options so no user or project Perl config runs.
+    if (controlled) args.unshift('-norc', '-no-shell-escape');
     if (clean) args.push('-gg');
     args.push(filePath);
+    let commandFailed = false;
     const { stdout, stderr } = await execFile(
       path.join(texbin, 'latexmk'), args,
       { cwd: this.repoPath, timeout: 180000, maxBuffer: 20 * 1024 * 1024, env }
-    ).catch(e => ({ stdout: e.stdout || '', stderr: e.stderr || e.message }));
+    ).catch(e => { commandFailed = true; return { stdout: e.stdout || '', stderr: e.stderr || e.message }; });
     const pdfPath = path.join(this.repoPath, filePath.replace(/\.tex$/, '.pdf'));
     let pdfExists = false;
     try { await access(pdfPath); pdfExists = true; } catch { /* no pdf */ }
-    return { stdout, stderr, log: `${stdout}\n${stderr}`, pdfPath: pdfExists ? pdfPath : null };
+    return { stdout, stderr, commandFailed, log: `${stdout}\n${stderr}`, pdfPath: !commandFailed && pdfExists ? pdfPath : null };
   }
 
-  async compileFile(filePath, engine = 'lualatex') {
-    const { log, pdfPath } = await this._runLatexmk(filePath, engine, { clean: false });
-    const errors = (log.match(/^!.*$/gm) || []).slice(0, 20);
-    const undefinedRefs = (log.match(/^(?:LaTeX|Package)[^\n]*Warning:[^\n]*(?:undefined|multiply)[^\n]*/gmi) || []);
-    const overfull = (log.match(/^(?:Overfull|Underfull)[^\n]*$/gm) || []).slice(0, 20);
-    return { pdfPath, errors, undefinedRefs, overfull, tail: log.slice(-2500) };
+  async compileFile(filePath, engine = 'lualatex', options = {}) {
+    return this.verifyBuild(filePath, engine, { ...options, force: true, clean: false });
   }
 
-  // Clean-from-scratch build + structured PASS/FAIL verdict on the "done" bar.
-  async verifyBuild(filePath, engine = 'lualatex') {
-    const { log: runLog, pdfPath } = await this._runLatexmk(filePath, engine, { clean: true });
-    // Classify the FINAL-pass log (e.g. main.log), NOT latexmk's concatenated
-    // multi-pass stdout: pass 1 (before the .aux exists) flags every \ref/\cite
-    // undefined, and those transient warnings would be false positives. main.log
-    // is the last engine run's output -- the true end state; a genuinely undefined
-    // ref persists there, a resolved one does not. Fall back to the run log if the
-    // .log file is missing (a catastrophic failure that produced no .log).
-    const logFile = path.join(this.repoPath, filePath.replace(/\.tex$/, '.log'));
+  async syncProject() {
+    if (!(await this._hasRepo())) return this.cloneOrPull();
+    // Explicit sync refuses conflicts. It never invokes the legacy hard-reset fallback.
+    const { stdout } = await this._git(['-C', this.repoPath, 'pull', '--ff-only'], { auth: true });
+    return stdout.trim() || 'Already up to date.';
+  }
+
+  async verifyBuild(filePath, engine = 'lualatex', options = {}) {
+    const key = path.resolve(this.repoPath);
+    const previous = buildQueues.get(key) || Promise.resolve();
+    const task = previous.catch(() => {}).then(() => this._verifyLocal(filePath, engine, options));
+    buildQueues.set(key, task);
+    try { return await task; } finally { if (buildQueues.get(key) === task) buildQueues.delete(key); }
+  }
+
+  async _verifyLocal(filePath, engine, options = {}) {
+    const { force = false, clean = true } = options;
+    const config = controlledBuildOptions(options);
+    const key = JSON.stringify([this.repoPath,filePath,engine,config]);
+    const fingerprint = () => buildFingerprint(this.repoPath,filePath,engine,config).catch(()=>null);
+    const sources = () => buildFingerprint(this.repoPath,filePath,engine,{...config,sourcesOnly:true});
+    const cached = verifiedBuilds.get(key);
+    const before = await sources();
+    if (!force && cached && cached.fingerprint === await fingerprint()) return { ...cached.verdict, reused: true };
+    verifiedBuilds.delete(key);
+    const { log: runLog, pdfPath, commandFailed } = await this._runLatexmk(filePath,engine,{clean,controlled:config.controlled});
+    const logPath = path.join(this.repoPath,filePath.replace(/\.tex$/,'.log'));
     let finalLog = runLog;
-    try { finalLog = await readFile(logFile, 'utf-8'); } catch { /* keep runLog */ }
+    try { finalLog = await readFile(logPath,'utf8'); } catch { /* failed before log creation */ }
     const verdict = classifyBuildLog(finalLog);
-    // Confirm the PDF against the real file, not just the log, so a parser miss
-    // can't yield a false PASS; then recompute the verdict.
+    if (commandFailed) verdict.errors.push('latexmk command failed; any previous PDF is not a successful build.');
     verdict.pdfProduced = pdfPath !== null;
-    verdict.pass = verdict.pdfProduced
-      && verdict.errors.length === 0
-      && verdict.undefinedRefs.length === 0
-      && verdict.undefinedCitations.length === 0;
-    verdict.tail = finalLog.slice(-2500);
+    verdict.pass = verdict.pdfProduced && !verdict.errors.length && !verdict.undefinedRefs.length && !verdict.undefinedCitations.length;
+    verdict.logPath = logPath;
+    verdict.pdfPath = pdfPath;
+    verdict.tail = (commandFailed ? runLog : finalLog).slice(-2500);
+    verdict.reused = false;
+    const after = await sources();
+    if (before && before !== after) { verdict.pass = false; verdict.errors.push('Project inputs changed during the build; verify the latest source again.'); }
+    const print = before && before === after ? await fingerprint() : null;
+    verdict.cacheEligible = Boolean(print);
+    if (verdict.pass && print) verifiedBuilds.set(key,{ fingerprint:print,verdict });
     return verdict;
   }
 
   // Read-only grep across tracked files. Regex by default; fixed -> -F; ignoreCase -> -i.
   async searchText({ query, fixed = false, ignoreCase = false, extension } = {}) {
     if (!query) throw new Error('search_text needs a query.');
-    await this.cloneOrPull();
+    await this.requireLocal();
     const args = ['-C', this.repoPath, 'grep', '-n', '--no-color', fixed ? '-F' : '-E'];
     if (ignoreCase) args.push('-i');
     args.push('-e', query);
@@ -485,7 +520,7 @@ class OverleafGitClient {
 
   // Read-only: cited keys (across .tex) vs defined keys (refs.bib).
   async citeLint() {
-    await this.cloneOrPull();
+    await this.requireLocal();
     const texFiles = await this.listFiles('.tex');
     const citeRe = /\\(?:cite|autocite|parencite|citep|citet|textcite|footcite|nocite)\*?(?:\[[^\]]*\])*\{([^}]+)\}/g;
     const cited = new Set();
@@ -973,12 +1008,21 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    ...[
+      ['dependency_index', 'Local static TeX dependencies and affected sections. Dynamic macros are reported as unresolved.', { changedFiles: { type: 'array', items: { type: 'string' } }, changedSymbols: { type: 'array', items: { type: 'string' } } }, []],
+      ['change_report', 'Compact local file and section changes against an in-process baseline. Omit baselineVersion to establish one.', { baselineVersion: { type: 'string' } }, []],
+      ['render_pages', 'Render explicitly selected PDF pages to cached local PNG paths. Pages are one-based; no sync or build.', { filePath: { type: 'string' }, pages: { type: 'array', items: { type: 'integer', minimum: 1 }, minItems: 1, maxItems: 20 }, dpi: { type: 'integer', minimum: 36, maximum: 300 } }, ['filePath', 'pages']],
+      ['usage_stats', 'In-process tool counts, durations, response bytes and cache hits. Stores no document content. Bytes are not billed tokens.', { reset: { type: 'boolean' } }, []],
+      ['apply_changes', 'Verify a UTF-8 multi-file batch in an isolated worktree, then commit it locally. Requires clean tracked source, HEAD baseRevision and SHA-256 baseHash per file (null for new files). No push.', { baseRevision: { type: 'string' }, changes: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'object', properties: { filePath: { type: 'string' }, baseHash: { type: ['string', 'null'] }, content: { type: 'string' } }, required: ['filePath', 'baseHash', 'content'] } }, filePath: { type: 'string' }, engine: { type: 'string' }, controlled: { type: 'boolean' }, externalInputs: { type: 'array', items: { type: 'string' } } }, ['baseRevision', 'changes', 'filePath']],
+      ['publish_changes', 'Explicitly verify the unchanged local revision and push once. No pull, retry, merge or reset. Requires publishing authorization.', { revision: { type: 'string' }, filePath: { type: 'string' }, engine: { type: 'string' }, controlled: { type: 'boolean' }, externalInputs: { type: 'array', items: { type: 'string' } } }, ['revision', 'filePath']],
+    ].map(([name, description, properties, required]) => ({ name, description, inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, ...properties }, required } })),
     {
       name: 'get_context',
-      description: 'Read writing guidelines + per-project context. Always call this at the start of any writing or editing session, and re-read whenever instructions feel forgotten. Both the guidelines and the project context md are re-read from disk on every call, so external edits take effect immediately without restarting.',
+      description: 'Read current writing and project context. Supply previousVersion to receive a compact unchanged response when content and project identity match.',
       inputSchema: {
         type: 'object',
         properties: {
+          previousVersion: { type: 'string', description: 'Version returned by the previous context read.' },
           projectName: { type: 'string', description: 'Project key. Omit to auto-detect from current working directory.' },
         },
       },
@@ -1108,6 +1152,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'sync_project',
+      description: 'Explicitly clone or fast-forward pull the selected project. Refuses conflicts; never hard-resets local edits. Builds do not sync.',
+      inputSchema: { type: 'object', properties: { projectName: { type: 'string' } } },
+    },
+    {
+      name: 'get_section_bundle',
+      description: 'Read a local section with directly referenced equation/figure blocks, bibliography entries and asset paths. No pull. Reports unresolved references and truncation; not a recursive TeX parser.',
+      inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, filePath: { type: 'string' }, sectionTitle: { type: 'string' }, maxChars: { type: 'integer', minimum: 2000, maximum: 64000 } }, required: ['filePath','sectionTitle'] },
+    },
+    {
       name: 'get_section_content',
       description: 'Get the body of a single section by title.',
       inputSchema: {
@@ -1122,10 +1176,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'compile_file',
-      description: 'Compile a .tex file locally with LuaLaTeX (default), XeLaTeX, or pdfLaTeX. Pulls before compiling. ALWAYS run this after write_file before declaring work done — silent build breakage is the most common failure mode.',
+      description: 'Compile a .tex file locally with LuaLaTeX (default), XeLaTeX, or pdfLaTeX. Local only; no pull. Compact verdict by default, verbose adds a log tail. Use for intermediate layout checks; verify_build provides the final gate.',
       inputSchema: {
         type: 'object',
         properties: {
+          controlled: { type: 'boolean', default: false, description: 'Ignore all latexmk rc files and disable shell escape. Opt in only when the project supports this mode.' },
+          externalInputs: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of additional build inputs to hash.' },
+          verbose: { type: 'boolean', default: false, description: 'Include a bounded log tail; full log remains on disk.' },
+          force: { type: 'boolean', default: false, description: 'Ignore a cached verification and rebuild.' },
           filePath: { type: 'string' },
           engine: { type: 'string', description: 'pdflatex | xelatex | lualatex (default lualatex)' },
           projectName: { type: 'string' },
@@ -1135,10 +1193,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'verify_build',
-      description: 'Compile the entrypoint FROM SCRATCH (clean aux) and return a PASS/FAIL verdict on the done-bar: PASS only if a PDF is produced with zero LaTeX errors, zero undefined references, and zero undefined citations. Reports page count; overfull/underfull boxes are warnings, not failures. Use as the final gate before declaring a writing task done.',
+      description: 'Verify the local entrypoint, reusing an unchanged eligible successful build unless force is true; otherwise compile from scratch and return a PASS/FAIL verdict on the done-bar: PASS only if a PDF is produced with zero LaTeX errors, zero undefined references, and zero undefined citations. Reports page count; overfull/underfull boxes are warnings, not failures. Use as the final gate before declaring a writing task done.',
       inputSchema: {
         type: 'object',
         properties: {
+          controlled: { type: 'boolean', default: false, description: 'Ignore all latexmk rc files and disable shell escape. Opt in only when the project supports this mode.' },
+          externalInputs: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of additional build inputs to hash.' },
+          verbose: { type: 'boolean', default: false, description: 'Include a bounded log tail; full log remains on disk.' },
+          force: { type: 'boolean', default: false, description: 'Ignore a cached verification and rebuild.' },
           filePath: { type: 'string', description: 'The entrypoint, usually main.tex.' },
           engine: { type: 'string', description: 'pdflatex | xelatex | lualatex (default lualatex).' },
           projectName: { type: 'string' },
@@ -1148,7 +1210,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'edit_file',
-      description: 'Surgical, conflict-safe edit: replace oldString with newString in a file, then commit and push. PREFER this over write_file for edits to existing files — it is far cheaper than a full rewrite and it cannot silently clobber a concurrent Overleaf edit (a missing oldString means the region changed; the edit refuses). Non-overlapping concurrent edits auto-merge. oldString must match exactly once unless replaceAll is true. After editing, call compile_file to verify the build.',
+      description: 'Surgical, conflict-safe edit: replace oldString with newString in a file, then commit and push. PREFER this over write_file for edits to existing files — it is far cheaper than a full rewrite and it cannot silently clobber a concurrent Overleaf edit (a missing oldString means the region changed; the edit refuses). Non-overlapping concurrent edits auto-merge. oldString must match exactly once unless replaceAll is true. After the edit batch, use verify_build as the single final gate.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1164,7 +1226,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'write_file',
-      description: 'Create a new file, or overwrite an existing one wholesale, then push. For edits to existing files prefer edit_file. Overwriting an existing file requires either baseSha (from read_file, so a stale write is refused) or overwrite:true. After writing, call compile_file to verify the build.',
+      description: 'Create a new file, or overwrite an existing one wholesale, then push. For edits to existing files prefer edit_file. Overwriting an existing file requires either baseSha (from read_file, so a stale write is refused) or overwrite:true. After the edit batch, use verify_build as the single final gate.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1261,7 +1323,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request) => observeTool(request.params.name, async () => {
   try {
     const { name, arguments: args } = request.params;
 
@@ -1501,7 +1563,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const key = pickProjectKey(config, args.projectName);
         const project = config.projects[key];
         let guidelines = '';
-        try { guidelines = await readFile(GUIDELINES_PATH, 'utf-8'); }
+        const guidelinesPath = resolveGuidelinesPath({ dataHome: DATA_HOME, packageDir: PACKAGE_DIR, exists: existsSync });
+        try { guidelines = await readFile(guidelinesPath, 'utf-8'); }
         catch { guidelines = '(writing-guidelines.md missing from OverleafMCP folder)'; }
         const ctx = await readContext(key, project);
         const text = [
@@ -1522,7 +1585,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ``,
           ctx.body,
         ].join('\n');
-        return { content: [{ type: 'text', text }] };
+        const v = versionedContext(key,text,args.previousVersion);
+        return { content: [{ type: 'text', text: `Context version: ${v.version}\n${v.text}` }], structuredContent: { version:v.version, unchanged:v.unchanged, projectName:key } };
       }
 
       case 'list_files': {
@@ -1536,7 +1600,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const content = await client.readFile(args.filePath);
         const baseSha = await client.getBlobSha(args.filePath, { pull: false });
         const header = `<!-- overleaf-mcp baseSha: ${baseSha || 'none'} (pass as baseSha to write_file to guard against clobbering Overleaf edits) -->\n`;
-        return { content: [{ type: 'text', text: header + content }] };
+        const { stdout } = await client._git(['-C', client.repoPath, 'rev-parse', 'HEAD']);
+        return { content: [{ type: 'text', text: header + content }], structuredContent: { baseSha, baseRevision: stdout.trim(), contentHash: createHash('sha256').update(content).digest('hex') } };
       }
 
       case 'get_sections': {
@@ -1551,41 +1616,66 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: content }] };
       }
 
-      case 'compile_file': {
+      case 'sync_project': {
         const { client } = await getClient(args.projectName);
-        const r = await client.compileFile(args.filePath, args.engine || 'lualatex');
-        const status = r.pdfPath ? `✓ PDF written to ${r.pdfPath}` : '✗ Compilation failed — no PDF produced';
-        const parts = [status];
-        if (r.errors.length)        parts.push(`\n--- Errors (${r.errors.length}) ---\n${r.errors.join('\n')}`);
-        if (r.undefinedRefs.length) parts.push(`\n--- Undefined refs/citations (${r.undefinedRefs.length}) ---\n${r.undefinedRefs.join('\n')}`);
-        if (r.overfull.length)      parts.push(`\n--- Overfull/Underfull (${r.overfull.length}) ---\n${r.overfull.join('\n')}`);
-        parts.push(`\n--- Log tail ---\n${r.tail}`);
-        return { content: [{ type: 'text', text: parts.join('\n').trim() }] };
+        return { content: [{ type:'text',text:await client.syncProject() }] };
       }
-
+      case 'usage_stats': {
+        const result = usageStats(args);
+        return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
+      }
+      case 'dependency_index':
+      case 'change_report':
+      case 'render_pages': {
+        const { client } = await getClient(args.projectName);
+        await client.requireLocal();
+        const result = name === 'dependency_index' ? await dependencyIndex(client.repoPath, args)
+          : name === 'change_report' ? await changeReport(client.repoPath, args.baselineVersion)
+          : await renderPages(client.repoPath, args);
+        return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
+      }
+      case 'apply_changes':
+      case 'publish_changes': {
+        const { client } = await getClient(args.projectName);
+        await client.requireLocal();
+        const verify = async root => {
+          const candidate = new OverleafGitClient(client.projectId, client.gitToken, root);
+          return candidate.verifyBuild(args.filePath, args.engine || 'lualatex', {
+            controlled: args.controlled === true,
+            externalInputs: args.externalInputs,
+          });
+        };
+        const result = name === 'apply_changes' ? await applyChanges(client.repoPath, args, verify)
+          : await publishChanges(client.repoPath, args, verify, async (root, revision, branch) => {
+            await client._git(['-C', root, 'push', 'origin', `${revision}:refs/heads/${branch}`], { auth: true });
+          });
+        return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
+      }
+      case 'get_section_bundle': {
+        const { client } = await getClient(args.projectName);
+        await client.requireLocal();
+        const result = await sectionBundle(client.repoPath,args.filePath,args.sectionTitle,args.maxChars);
+        return { content: [{type:'text',text:JSON.stringify(result)}] };
+      }
+      case 'compile_file':
       case 'verify_build': {
         const { client } = await getClient(args.projectName);
-        const v = await client.verifyBuild(args.filePath, args.engine || 'lualatex');
-        if (v.pass) {
-          const warn = (v.overfullCount || v.underfullCount)
-            ? ` (note: ${v.overfullCount} overfull / ${v.underfullCount} underfull boxes)` : '';
-          return { content: [{ type: 'text', text: `✓ PASS — ${v.pageCount} pages${warn}` }] };
-        }
-        const parts = ['✗ FAIL'];
-        if (!v.pdfProduced) parts.push('- no PDF produced');
-        if (v.errors.length) parts.push(`- ${v.errors.length} error(s):\n${v.errors.slice(0, 20).join('\n')}`);
-        if (v.undefinedRefs.length) parts.push(`- ${v.undefinedRefs.length} undefined reference(s):\n${v.undefinedRefs.slice(0, 20).join('\n')}`);
-        if (v.undefinedCitations.length) parts.push(`- ${v.undefinedCitations.length} undefined citation(s):\n${v.undefinedCitations.slice(0, 20).join('\n')}`);
-        if (v.overfullCount || v.underfullCount) parts.push(`- (warnings) ${v.overfullCount} overfull / ${v.underfullCount} underfull`);
-        parts.push(`\n--- log tail ---\n${v.tail}`);
-        return { content: [{ type: 'text', text: parts.join('\n') }] };
+        const v = name === 'compile_file'
+          ? await client.compileFile(args.filePath,args.engine || 'lualatex',args)
+          : await client.verifyBuild(args.filePath,args.engine || 'lualatex',args);
+        const parts = [`${v.pass ? 'PASS' : 'FAIL'}: ${v.pageCount ?? '?'} pages; ${v.errors.length} errors; ${v.undefinedRefs.length} undefined references; ${v.undefinedCitations.length} undefined citations; ${v.overfullCount} overfull / ${v.underfullCount} underfull boxes.`,
+          `Reused verification: ${v.reused}. Full log: ${v.logPath}`];
+        if (!v.pass) parts.push(...v.errors.slice(0,5),...v.undefinedRefs.slice(0,5),...v.undefinedCitations.slice(0,5));
+        if (args.verbose) parts.push(v.tail);
+        if (!v.cacheEligible && !v.reused) parts.push('Cache not retained: dependency closure unavailable, executable configuration, or changing inputs.');
+        return { content:[{type:'text',text:parts.join('\n')}], structuredContent: { pass: v.pass, pageCount: v.pageCount, reused: v.reused, cacheEligible: v.cacheEligible, errors: v.errors.slice(0,5), logPath: v.logPath } };
       }
 
       case 'edit_file': {
         const { client } = await getClient(args.projectName);
         const res = await client.editFile(args.filePath, args.oldString, args.newString, args.replaceAll || false, args.commitMessage);
         const tail = res.pushed
-          ? `Edited ${args.filePath}${res.merged ? ' (auto-merged a concurrent Overleaf change)' : ''}. NEXT STEP: call compile_file on the project main .tex to verify the build.`
+          ? `Edited ${args.filePath}${res.merged ? ' (auto-merged a concurrent Overleaf change)' : ''}. NEXT: finish the coherent edit batch, then verify_build once on the entrypoint.`
           : `No change applied to ${args.filePath} (${res.reason}).`;
         return { content: [{ type: 'text', text: tail }] };
       }
@@ -1598,7 +1688,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           commitMessage: args.commitMessage,
         });
         const tail = res.pushed
-          ? `Wrote ${args.filePath}. NEXT STEP: call compile_file on the project main .tex to verify the build.`
+          ? `Wrote ${args.filePath}. NEXT: finish the coherent edit batch, then verify_build once on the entrypoint.`
           : `No change detected for ${args.filePath} (${res.reason}).`;
         return { content: [{ type: 'text', text: tail }] };
       }
@@ -1693,14 +1783,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error) {
-    // Defense in depth: scrub any tokenized URL that might surface in an error.
-    const msg = String(error?.message ?? error).replace(/git:[^@\s/]+@/g, 'git:***@');
-    return {
-      content: [{ type: 'text', text: `Error: ${msg}` }],
-      isError: true,
-    };
+    return toolError(error);
   }
-});
+})());
 
 async function main() {
   const transport = new StdioServerTransport();

@@ -180,7 +180,7 @@ That creates `~/.overleaf-mcp/projects.json` from the example and copies the edi
 
 ### Where files live
 
-User state (the `projects.json`, per-project `contexts/`, customised `templates/`, and the git clones) lives in the **data home**, resolved as: `$OVERLEAF_MCP_HOME` if set, else the package directory when it already holds a `projects.json` (so an existing local clone keeps working untouched), else `~/.overleaf-mcp`. Bundled, read-only defaults (the templates and the stock writing-guidelines) ship inside the package; a copy you place in the data home overrides the bundled one.
+User state (the `projects.json`, per-project `contexts/`, customised `templates/`, and the git clones) lives in the **data home**, resolved as: `$OVERLEAF_MCP_HOME` if set, else the package directory when it already holds a `projects.json` (so an existing local clone keeps working untouched), else `~/.overleaf-mcp`. Bundled, read-only defaults (the templates and the stock writing-guidelines) ship inside the package; a copy you place in the data home overrides the bundled one. For personal writing rules, use `writing-guidelines.local.md` (gitignored, read first on every `get_context` call); it stays distinct from the bundled file even when the data home is the package directory.
 
 ### Getting Overleaf credentials
 
@@ -298,7 +298,7 @@ By the built-in convention this parses the name, locates the parent course folde
 
 ## How it works
 
-Each project is a normal git clone of its Overleaf repo, kept under `repoDir` (or `localPath`). On every operation the server pulls the latest, performs the read/edit/build locally, and pushes. Git runs through `execFile` with argument arrays (no shell), so file paths, commit messages, and patterns can't inject commands. Authentication uses an inline git credential helper that reads the token from the process environment, so the token is never written into a remote URL, a command line, or an error message; the clone's `origin` stays token-free. `compile_file` and `verify_build` shell out to `latexmk` from the repo root so the project's own `.latexmkrc` governs the build.
+Each project is a normal git clone of its Overleaf repo, kept under `repoDir` (or `localPath`). `sync_project` is the only synchronization command. Read, search, lint, dependency, render and build tools use the existing clone without pulling. This gives a task a stable source snapshot and prevents a read from replacing local edits. Git runs through `execFile` with argument arrays (no shell), so file paths, commit messages, and patterns can't inject commands. Authentication uses an inline git credential helper that reads the token from the process environment, so the token is never written into a remote URL, a command line, or an error message; the clone's `origin` stays token-free.
 
 ## Testing & development
 
@@ -324,3 +324,17 @@ Forked from [mjyoo2/OverleafMCP](https://github.com/mjyoo2/OverleafMCP). The ori
 ## License
 
 MIT. See [LICENSE](LICENSE) if present, or treat this as MIT per the upstream project.
+
+## Efficient local reading and builds
+
+- `get_context({projectName, previousVersion})` returns a context version and omits unchanged content. The version covers project identity and the rendered guidance/context.
+- `get_section_bundle({projectName, filePath, sectionTitle, maxChars})` reads locally without pulling and returns directly referenced equation/figure blocks, matching BibTeX entries and asset paths. It reports missing matches and truncation. Macro-generated references, recursive TeX expansion and parenthesized BibTeX entries require a focused follow-up read.
+- All read, search, lint, dependency, render and build tools are local-only. Use `sync_project` explicitly before reading when needed. Existing clone synchronization uses fast-forward-only pull and refuses conflicts without resetting local work.
+- Build output is compact by default. `verbose: true` includes a bounded log tail; the full log remains at the returned path.
+- `verify_build` can reuse a successful verification within the running server when project files, recorder inputs, tool binaries, environment and output artifacts are unchanged. `force: true` rebuilds. Missing recorder data, symlinks or executable build configuration conservatively disable reuse. The cache is in-memory and disappears on server restart. Custom build commands can have undeclared external dependencies, so projects with latexmkrc files or detected shell/Lua generation rebuild.
+- `controlled: true` runs `latexmk -norc -no-shell-escape` and permits caching in projects with a `.latexmkrc`, because the rc file cannot run. The mode still rejects shell escape, `minted` and Lua file generation. Add required absolute regular `externalInputs` so their content enters the cache key.
+- `dependency_index` records static TeX includes, figures, labels, references, citations and declared values. `change_report` compares a later index to a retained baseline and names affected sections. Dynamic macros are reported as unresolved rather than guessed.
+- `render_pages` caches a requested PDF page by PDF content hash, page, DPI and renderer version. `usage_stats` exposes aggregate in-process timing, response-size and cache-hit measurements without retaining request or document text.
+- `apply_changes` verifies an SHA-guarded UTF-8 multi-file candidate in an isolated worktree and fast-forwards one local commit only if verification passes. `publish_changes` separately re-verifies its exact clean revision, then pushes it once. Neither operation pulls, resets, retries or silently merges.
+
+After updating the server, reconnect the MCP client so it reloads the process and tool schemas. Package publication is separate from installing these local changes.

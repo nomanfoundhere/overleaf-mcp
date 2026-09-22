@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { resolveDataHome, synthesizeConfigFromEnv, mergeSettings } from '../overleaf-mcp-server.js';
+import { resolveDataHome, resolveGuidelinesPath, synthesizeConfigFromEnv, mergeSettings } from '../overleaf-mcp-server.js';
 
 const HOMEDIR_M = '/home/user';
 
@@ -119,4 +119,26 @@ test('mergeSettings: unknown keys are ignored', () => {
   const { settings, provided } = mergeSettings({}, { bogus: 'x', repoDir: '/r' }, HOMEDIR_M);
   assert.deepEqual(provided, ['repoDir']);
   assert.equal(settings.bogus, undefined);
+});
+
+// --- resolveGuidelinesPath: .local → data-home copy → bundled default ---
+
+const has = (...present) => (p) => present.includes(p);
+
+test('resolveGuidelinesPath: .local wins even when dataHome is the package dir', () => {
+  const got = resolveGuidelinesPath({ dataHome: PKG, packageDir: PKG,
+    exists: has(path.join(PKG, 'writing-guidelines.local.md'), path.join(PKG, 'writing-guidelines.md')) });
+  assert.equal(got, path.join(PKG, 'writing-guidelines.local.md'));
+});
+
+test('resolveGuidelinesPath: a data-home copy overrides the bundled default', () => {
+  const data = path.join(HOME, '.overleaf-mcp');
+  const got = resolveGuidelinesPath({ dataHome: data, packageDir: PKG,
+    exists: has(path.join(data, 'writing-guidelines.md'), path.join(PKG, 'writing-guidelines.md')) });
+  assert.equal(got, path.join(data, 'writing-guidelines.md'));
+});
+
+test('resolveGuidelinesPath: falls back to the bundled default', () => {
+  const got = resolveGuidelinesPath({ dataHome: path.join(HOME, '.overleaf-mcp'), packageDir: PKG, exists: has() });
+  assert.equal(got, path.join(PKG, 'writing-guidelines.md'));
 });

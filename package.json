@@ -1,6 +1,6 @@
 {
   "name": "overleaf-forge",
-  "version": "2.9.1",
+  "version": "2.10.0",
   "description": "MCP server to read, edit, compile, and verify Overleaf/LaTeX projects over git: conflict-safe edits, figure upload, clean-build verification, citation and voice linting.",
   "type": "module",
   "main": "overleaf-mcp-server.js",
@@ -12,7 +12,12 @@
     "templates/",
     "examples/",
     "writing-guidelines.md",
-    "projects.example.json"
+    "projects.example.json",
+    "efficiency.js",
+    "dependency-index.js",
+    "render-cache.js",
+    "transactions.js",
+    "runtime-observability.js"
   ],
   "scripts": {
     "start": "node overleaf-mcp-server.js",

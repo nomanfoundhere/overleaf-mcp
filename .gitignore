@@ -9,3 +9,5 @@ docs/
 *.tgz
 repos/
 templates.local/
+references.local/
+*.local.md

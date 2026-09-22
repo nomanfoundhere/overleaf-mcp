@@ -8,11 +8,12 @@ import { makeRemote, clientClonePath, readFromRemote } from './helpers.mjs';
 const execFile = promisify(ef);
 const git = (cwd, a) => execFile('git', ['-C', cwd, ...a]);
 function client(r) { return new OverleafGitClient('test', 'tok', clientClonePath(r.root), r.remote); }
+async function localClient(r) { const c = client(r); await c.cloneOrPull(); return c; }
 
 test('searchText finds a regex match with file:line', async () => {
   const r = await makeRemote({ 'main.tex': 'a\n\\label{sec:x}\n\\autoref{sec:x}\n' });
   after(() => r.cleanup());
-  const res = await client(r).searchText({ query: '\\\\label\\{' });
+  const res = await (await localClient(r)).searchText({ query: '\\\\label\\{' });
   assert.equal(res.total, 1);
   assert.match(res.matches[0], /^main\.tex:2:/);
 });
@@ -20,7 +21,7 @@ test('searchText finds a regex match with file:line', async () => {
 test('searchText extension filter + no-match', async () => {
   const r = await makeRemote({ 'main.tex': 'hello\n', 'refs.bib': '@article{onlyinbib, title={X}}\n' });
   after(() => r.cleanup());
-  const c = client(r);
+  const c = await localClient(r);
   assert.equal((await c.searchText({ query: 'onlyinbib', extension: '.tex' })).total, 0);
   assert.equal((await c.searchText({ query: 'zzz-nomatch' })).total, 0);
 });
@@ -48,7 +49,7 @@ test('citeLint reports undefined and unused', async () => {
     'refs.bib': '@article{a, title={A}}\n@book{c, title={C}}\n',
   });
   after(() => r.cleanup());
-  const res = await client(r).citeLint();
+  const res = await (await localClient(r)).citeLint();
   assert.deepEqual(res.undefined, ['b']);
   assert.deepEqual(res.unused, ['c']);
 });
