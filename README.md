@@ -26,19 +26,22 @@ Rough token cost per operation on such a chapter, and the cut each tool buys:
 Figures are order-of-magnitude, for a chapter this size; the absolute numbers scale with file size, the percentages roughly hold.
 
 - **Anchored edits instead of whole-file rewrites.** Changing one phrase by reading the whole file and writing it back costs roughly 25K tokens per edit: the file into context, then the file back out as the write payload. `edit_file` sends only the old and new strings and returns a one-line confirmation, on the order of 100 tokens. Across a dozen edits to a single chapter that is the difference between roughly 170K tokens and 3K.
-- **A one-line build verdict instead of a raw log.** `verify_build` returns `✓ PASS — 24 pages` rather than the `latexmk` output. A raw log runs to hundreds or thousands of tokens per compile, and a multi-pass log buries the true final state under transient undefined-reference warnings from early passes (the exact trap `verify_build` classifies away by reading the final log). Over a session of repeated compiles that is a few thousand tokens against a few dozen.
+- **A one-line build verdict instead of a raw log.** `verify_build` returns a one-line verdict (`PASS: 24 pages; 0 errors; 0 undefined references; ...`) rather than the `latexmk` output. A raw log runs to hundreds or thousands of tokens per compile, and a multi-pass log buries the true final state under transient undefined-reference warnings from early passes (the exact trap `verify_build` classifies away by reading the final log). Over a session of repeated compiles that is a few thousand tokens against a few dozen.
 - **Section and grep reads instead of the whole file.** `get_section_content` returns one section and `search_text` returns the matching lines, so locating something costs 1K to 3K tokens rather than the full 13K.
 
 For an iterative edit, build, and review loop on a large document the tool traffic runs about an order of magnitude lighter than a read-and-rewrite-the-whole-file approach. The gain is workflow-dependent: a single full-file rewrite is a wash, since `write_file` moves the same bytes either way. It is the repeated, surgical work that compounds, which is exactly the shape of writing and revising a paper.
 
 ## Features
 
-- **Surgical, conflict-safe edits**: `edit_file` replaces an exact anchor and refuses if the region changed on Overleaf; non-overlapping concurrent edits auto-merge via git.
+- **Local-first, publish when verified**: edits commit to the local clone and stay off the network; `publish_changes` verifies the build once and pushes the whole batch. `settings.autoPush` restores push-on-every-write.
+- **Surgical, conflict-safe edits**: `edit_file` replaces an exact anchor and refuses if the region changed; when pushing, non-overlapping concurrent edits auto-merge via git.
 - **No silent clobbering**: full-file `write_file` requires a freshness token (`baseSha`) or an explicit `overwrite` to replace an existing file.
-- **Binary / figure upload**: push PNG/PDF figures from disk (single or a whole set in one commit), byte-exact, path-confined to the project.
-- **Build verification**: `verify_build` compiles from scratch with `latexmk` and returns PASS/FAIL on the real "done" bar (a PDF, zero errors, zero undefined references/citations) with the page count.
+- **Divergence recovery**: `sync_project` reports what differs between the clone and Overleaf without changing anything, then resolves it by rebase (aborts cleanly on conflict) or by a confirmed reset that tags a backup first.
+- **Binary / figure upload**: add PNG/PDF figures from disk (single or a whole set in one commit), byte-exact, path-confined to the project.
+- **Build verification**: `verify_build` compiles from scratch with `latexmk` and returns PASS/FAIL on the real "done" bar (a PDF, zero errors, zero undefined references/citations) with the page count. Unchanged successful builds are reused; `clean: false` gives a quick intermediate rebuild; `lint` makes voice-linter findings fail the gate.
 - **Citation tooling**: append BibTeX entries with duplicate-key protection; lint for undefined and unused citations.
-- **Section-aware reading**: list sections and pull a single section's body by title.
+- **Section-aware reading**: list sections and pull a single section's body by title, optionally bundled with the equations, figures and bibliography entries it references.
+- **Dependency tracking**: `dependency_index` and `change_report` name the sections affected by a changed label, value, citation or included file.
 - **Project grep**: `search_text` over tracked files.
 - **Snapshots**: `checkpoint` a rollback point before a risky edit; `restore` it as a forward commit (no force-push, no history rewrite).
 - **Recurring-document bootstrap**: one call to clone, register, and scaffold a new instance of a structured document (see [Bootstrap](#bootstrap-for-recurring-structured-documents)).
@@ -76,7 +79,7 @@ For an iterative edit, build, and review loop on a large document the tool traff
 
 3. Restart the client (or reload its MCP servers). That's it.
 
-`npx` fetches and runs the published package on demand. The token and project id are the entire setup for a single project, with no config file (this is **env-only mode**). `@latest` means each client restart picks up the newest published version automatically; pin `overleaf-forge@2.7.1` instead to freeze a version. For multiple projects, per-project contexts, or the SSA bootstrap, see [Configuration](#configuration).
+`npx` fetches and runs the published package on demand. The token and project id are the entire setup for a single project, with no config file (this is **env-only mode**). `@latest` means each client restart picks up the newest published version automatically; pin `overleaf-forge@2.11.0` instead to freeze a version. For multiple projects, per-project contexts, or the SSA bootstrap, see [Configuration](#configuration).
 
 An MCP server is not an app you launch yourself: the client starts it as a subprocess, so "installing" it just means making its command available to the client. The `npx` form above needs no install step. If you would rather have a real command on your `PATH`, install it globally:
 
@@ -111,13 +114,15 @@ Restart the client (or reload its MCP servers) after editing, so it spawns the s
 
 ## Updating
 
-**As a user.** With `overleaf-forge@latest` in your config (the recommended form), restart the client or reload its MCP servers and it fetches the newest published version. If you pinned a version (`overleaf-forge@2.7.1`), change the number. If `npx` seems to keep running an old version, clear its cache with `npx clear-npx-cache` and restart. If you installed globally instead, update with `npm update -g overleaf-forge`.
+**As a user.** With `overleaf-forge@latest` in your config (the recommended form), restart the client or reload its MCP servers and it fetches the newest published version. If you pinned a version (`overleaf-forge@2.11.0`), change the number. If `npx` seems to keep running an old version, clear its cache with `npx clear-npx-cache` and restart. If you installed globally instead, update with `npm update -g overleaf-forge`.
+
+**Upgrading to 2.11: edits no longer push by default.** `edit_file`, `write_file`, `upload_file`, `add_citation` and `restore` now commit to the local clone and report the unpublished count; nothing reaches Overleaf until `publish_changes` runs. To keep the old push-on-every-write behaviour, set `autoPush: true` through `configure` (or pass `push: true` per call). Since 2.10, reads and builds also stop pulling, so start a session with `sync_project` when Overleaf may have moved. `compile_file` is now `verify_build({clean: false})`, and `get_section_bundle` is now `get_section_content({bundle: true})`.
 
 **As the maintainer (publishing a new release).** From the repository:
 
 ```bash
 npm version patch        # or minor / major; bumps package.json and tags
-npm publish              # enter your npm 2FA one-time code when prompted
+npm publish              # approve the npm 2FA prompt (browser or one-time code)
 git push --follow-tags   # push the commit and the version tag
 ```
 
@@ -222,7 +227,8 @@ A typical editing session, in the model's words:
 2. *"Show me the sections in `Chapters/ch2.tex`."* → `get_sections`
 3. *"In `Chapters/ch2.tex`, change `\section{Intro}` to `\section{Introduction}`."* → `edit_file` (anchored, conflict-safe)
 4. *"Add a figure: upload `~/plots/fig1.png` to `figures/fig1.png`."* → `upload_file`
-5. *"Verify the build."* → `verify_build` → `✓ PASS — 12 pages`
+5. *"Verify the build."* → `verify_build` → `PASS: 12 pages; 0 errors; ...`
+6. *"Publish it."* → `publish_changes` (pushes every verified local commit to Overleaf at once)
 
 Every write commits locally; `verify_build` is the gate before calling the work done, and `publish_changes` pushes the verified commits to Overleaf in one step. Set `settings.autoPush: true` (or pass `push: true`) to push on every write instead.
 
@@ -288,6 +294,16 @@ By the built-in convention this parses the name, locates the parent course folde
 | `verify_build` | Compile with `latexmk` from the repo root (project `.latexmkrc`, reruns and bibliography apply) + PASS/FAIL verdict: PASS only with a PDF and zero errors / undefined references / undefined citations. Reports page count. Default is the clean from-scratch done-bar gate; `clean: false` is a quick incremental rebuild; `lint` adds voice-linter findings to the gate. |
 | `sync_project` | Fetch and reconcile with Overleaf: fast-forward, report divergence, or resolve it with `rebase` / confirmed `reset` (see Conflict safety). |
 | `publish_changes` | Verify the clean local HEAD and push every unpublished commit once. |
+| `apply_changes` | Verify a SHA-guarded multi-file batch in an isolated worktree, then commit it locally only if it passes. |
+
+**Analysis & measurement**
+
+| Tool | Purpose |
+| --- | --- |
+| `dependency_index` | Static map of includes, figures, labels, references, citations and declared values; names the sections a change affects. |
+| `change_report` | Compact file and section changes against a retained baseline. |
+| `render_pages` | Render chosen PDF pages to cached PNGs for visual checks. |
+| `usage_stats` | In-process call counts, durations, response sizes and cache hits (no document text). |
 
 **Citations, snapshots, voice**
 
@@ -298,6 +314,21 @@ By the built-in convention this parses the name, locates the parent course folde
 | `checkpoint` | Mark a local rollback point (a `mcp-snap/<label>` tag) before a risky edit. |
 | `restore` | Roll back to a checkpoint via a forward commit (no force, no history rewrite). |
 | `voice_lint` | Run a prose linter on a `.tex` (the bundled `examples/voice-lint.mjs` by default; override via `settings.voiceLinter`). Lints the local working copy as-is, never pulls. Read-only and advisory; `verify_build` with `lint` makes it gating. |
+
+## Local reads, builds and batches
+
+- `get_context({projectName, previousVersion})` returns a context version and omits unchanged content. The version covers project identity and the rendered guidance/context.
+- `get_section_content({projectName, filePath, sectionTitle, bundle: true, maxChars})` reads locally without pulling and returns directly referenced equation/figure blocks, matching BibTeX entries and asset paths. It reports missing matches and truncation. Macro-generated references, recursive TeX expansion and parenthesized BibTeX entries require a focused follow-up read.
+- All read, search, lint, dependency, render and build tools are local-only. Use `sync_project` explicitly before reading when needed. It fast-forwards only; divergence is reported, never auto-resolved.
+- Build output is compact by default. `verbose: true` includes a bounded log tail; the full log remains at the returned path.
+- `verify_build` can reuse a successful verification within the running server when project files, recorder inputs, tool binaries, environment and output artifacts are unchanged. `force: true` rebuilds. Missing recorder data, symlinks or executable build configuration conservatively disable reuse. The cache is in-memory and disappears on server restart. Custom build commands can have undeclared external dependencies, so projects with latexmkrc files or detected shell/Lua generation rebuild.
+- `controlled: true` runs `latexmk -norc -no-shell-escape` and permits caching in projects with a `.latexmkrc`, because the rc file cannot run. The mode still rejects shell escape, `minted` and Lua file generation. Add required absolute regular `externalInputs` so their content enters the cache key.
+- `dependency_index` records static TeX includes, figures, labels, references, citations and declared values. `change_report` compares a later index to a retained baseline and names affected sections. Dynamic macros are reported as unresolved rather than guessed.
+- `render_pages` caches a requested PDF page by PDF content hash, page, DPI and renderer version. `usage_stats` exposes aggregate in-process timing, response-size and cache-hit measurements without retaining request or document text.
+- Write tools commit locally unless `push: true` or `settings.autoPush` is set, and report HEAD plus the unpublished count.
+- `apply_changes` verifies an SHA-guarded UTF-8 multi-file candidate in an isolated worktree and fast-forwards one local commit only if verification passes. `publish_changes` separately re-verifies its exact clean revision, then pushes it once, carrying every unpublished local commit. Neither operation pulls, resets, retries or silently merges.
+
+After updating the server, reconnect the MCP client so it reloads the process and tool schemas.
 
 ## How it works
 
@@ -327,17 +358,3 @@ Forked from [mjyoo2/OverleafMCP](https://github.com/mjyoo2/OverleafMCP). The ori
 ## License
 
 MIT. See [LICENSE](LICENSE) if present, or treat this as MIT per the upstream project.
-
-## Efficient local reading and builds
-
-- `get_context({projectName, previousVersion})` returns a context version and omits unchanged content. The version covers project identity and the rendered guidance/context.
-- `get_section_content({projectName, filePath, sectionTitle, bundle: true, maxChars})` reads locally without pulling and returns directly referenced equation/figure blocks, matching BibTeX entries and asset paths. It reports missing matches and truncation. Macro-generated references, recursive TeX expansion and parenthesized BibTeX entries require a focused follow-up read.
-- All read, search, lint, dependency, render and build tools are local-only. Use `sync_project` explicitly before reading when needed. It fast-forwards only; divergence is reported, never auto-resolved.
-- Build output is compact by default. `verbose: true` includes a bounded log tail; the full log remains at the returned path.
-- `verify_build` can reuse a successful verification within the running server when project files, recorder inputs, tool binaries, environment and output artifacts are unchanged. `force: true` rebuilds. Missing recorder data, symlinks or executable build configuration conservatively disable reuse. The cache is in-memory and disappears on server restart. Custom build commands can have undeclared external dependencies, so projects with latexmkrc files or detected shell/Lua generation rebuild.
-- `controlled: true` runs `latexmk -norc -no-shell-escape` and permits caching in projects with a `.latexmkrc`, because the rc file cannot run. The mode still rejects shell escape, `minted` and Lua file generation. Add required absolute regular `externalInputs` so their content enters the cache key.
-- `dependency_index` records static TeX includes, figures, labels, references, citations and declared values. `change_report` compares a later index to a retained baseline and names affected sections. Dynamic macros are reported as unresolved rather than guessed.
-- `render_pages` caches a requested PDF page by PDF content hash, page, DPI and renderer version. `usage_stats` exposes aggregate in-process timing, response-size and cache-hit measurements without retaining request or document text.
-- `apply_changes` verifies an SHA-guarded UTF-8 multi-file candidate in an isolated worktree and fast-forwards one local commit only if verification passes. `publish_changes` separately re-verifies its exact clean revision, then pushes it once, carrying every unpublished local commit. Neither operation pulls, resets, retries or silently merges.
-
-After updating the server, reconnect the MCP client so it reloads the process and tool schemas. Package publication is separate from installing these local changes.
