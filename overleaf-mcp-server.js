@@ -18,7 +18,7 @@ import { dependencyIndex, changeReport } from './dependency-index.js';
 import { renderPages } from './render-cache.js';
 import { applyChanges, publishChanges } from './transactions.js';
 import { observeTool, usageStats, toolError } from './runtime-observability.js';
-import { versionedContext, buildFingerprint, sectionBundle, controlledBuildOptions } from './efficiency.js';
+import { versionedContext, buildFingerprint, sectionBundle, sectionText, controlledBuildOptions } from './efficiency.js';
 const verifiedBuilds = new Map();
 const buildQueues = new Map();
 
@@ -215,7 +215,8 @@ const SETTING_HELP = {
   ssaSubdir:    'What subfolder name should new SSAs go under inside each course folder? (e.g. "MY SSAs")',
   templatesDir: 'Use your own scaffold templates? Give the directory holding main.tex / context-scaffold.md (blank keeps the bundled examples).',
   voiceLinter:  'Use your own prose linter for voice_lint? Give the command (takes a file path, exits non-zero on findings; blank keeps the bundled example).',
-  gitToken:     'Overleaf git token (prefer the OVERLEAF_GIT_TOKEN env var; set here only if you must store it in projects.json).',
+  autoPush:     'Should edit tools push to Overleaf immediately (true), or commit locally until publish_changes sends a verified batch (false, the default)?',
+  gitToken:    'Overleaf git token (prefer the OVERLEAF_GIT_TOKEN env var; set here only if you must store it in projects.json).',
 };
 const SETTING_KEYS = Object.keys(SETTING_HELP);
 const SETTING_PATHY = new Set(['repoDir', 'academicRoot', 'templatesDir']);
@@ -234,6 +235,14 @@ export function mergeSettings(current, args, homeDir) {
     provided.push(k);
   }
   return { settings, provided };
+}
+
+// Whether a mutating tool pushes to Overleaf. An explicit per-call `push` wins,
+// then settings.autoPush; the default is false, so edits stay local commits
+// until publish_changes verifies and sends them in one deliberate step.
+export function resolvePush(settings, args) {
+  if (typeof args?.push === 'boolean') return args.push;
+  return settings?.autoPush === true;
 }
 
 // Default project resolution:
@@ -347,6 +356,61 @@ class OverleafGitClient {
     if (!(await this._hasRepo())) throw Object.assign(new Error('Local clone missing; call sync_project explicitly.'), { code: 'LOCAL_CLONE_MISSING' });
   }
 
+  // Mutations that push absorb remote edits first; local-only mutations stay
+  // off the network entirely, like reads.
+  async _prepareMutation(push) {
+    if (push) await this.cloneOrPull();
+    else await this.requireLocal();
+    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
+    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
+    return this._head();
+  }
+
+  async _head() {
+    const { stdout } = await this._git(['-C', this.repoPath, 'rev-parse', 'HEAD']);
+    return stdout.trim();
+  }
+
+  // HEAD plus the number of local commits not yet on the remote-tracking branch.
+  // unpublished is null when there is no tracking ref to compare against.
+  async pendingState() {
+    const head = await this._head();
+    const branch = await this._currentBranch();
+    let unpublished = null;
+    try {
+      const { stdout } = await this._git(['-C', this.repoPath, 'rev-list', '--count', `origin/${branch}..HEAD`]);
+      unpublished = Number(stdout.trim());
+    } catch { /* no tracking ref */ }
+    return { head, unpublished };
+  }
+
+  // Finish a mutation whose commit is already made. push:false keeps it local
+  // for publish_changes. A refused push rolls back to preHead, this operation's
+  // own starting point: only its commit is undone, and earlier unpublished
+  // commits survive. (Resetting to origin/<branch> would silently drop them.)
+  async _finishMutation(preHead, push, { merge = false, refusal }) {
+    if (!push) return { pushed: false, committed: true, ...(await this.pendingState()) };
+    if (merge) return this._pushWithMerge(preHead);
+    try {
+      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
+    } catch (e) {
+      await this._git(['-C', this.repoPath, 'reset', '--hard', preHead]).catch(() => {});
+      throw new Error(`${refusal} (${(e.stderr || e.message || '').slice(0, 120)})`);
+    }
+    return { pushed: true };
+  }
+
+  // git commit that reports "nothing to commit" as a value instead of throwing.
+  async _commit(message) {
+    try {
+      await this._git(['-C', this.repoPath, 'commit', '-m', message]);
+      return true;
+    } catch (e) {
+      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) return false;
+      throw e;
+    }
+  }
+
   async listFiles(extension = '.tex') {
     await this.requireLocal();
     const out = [];
@@ -430,19 +494,101 @@ class OverleafGitClient {
     return this.verifyBuild(filePath, engine, { ...options, force: true, clean: false });
   }
 
-  async syncProject() {
-    if (!(await this._hasRepo())) return this.cloneOrPull();
-    // Explicit sync refuses conflicts. It never invokes the legacy hard-reset fallback.
-    const { stdout } = await this._git(['-C', this.repoPath, 'pull', '--ff-only'], { auth: true });
-    return stdout.trim() || 'Already up to date.';
+  // Explicit sync. Fetches, then acts on the ahead/behind relation:
+  //   behind only        -> fast-forward
+  //   ahead only / equal -> nothing to do (ahead = unpublished local commits)
+  //   diverged           -> report both sides and change nothing, unless a
+  //                         strategy is chosen:
+  //     'rebase' replays local commits onto the remote; a conflict aborts back
+  //              to the untouched pre-sync state.
+  //     'reset'  discards local work to match the remote. Requires confirm to
+  //              equal the reported local HEAD (proof the report was read), and
+  //              tags the old HEAD and any uncommitted edits as mcp-backup/*
+  //              first, so nothing becomes unrecoverable.
+  async syncProject({ strategy, confirm } = {}) {
+    if (!(await this._hasRepo())) {
+      await this.cloneOrPull();
+      return { state: 'cloned', ...(await this.pendingState()) };
+    }
+    if (strategy !== undefined && strategy !== 'rebase' && strategy !== 'reset') {
+      throw new Error(`Unknown strategy "${strategy}". Use "rebase" or "reset".`);
+    }
+    const g = (args, opts) => this._git(['-C', this.repoPath, ...args], opts);
+    await g(['remote', 'set-url', 'origin', this.gitUrl]).catch(() => {});
+    await g(['fetch', 'origin'], { auth: true });
+    // rebase and stash create write commits, which need a committer identity.
+    await g(['config', 'user.email', 'claude@anthropic.com']);
+    await g(['config', 'user.name', 'Claude']);
+    const branch = await this._currentBranch();
+    const upstream = `origin/${branch}`;
+    const count = async range => Number((await g(['rev-list', '--count', range])).stdout.trim());
+    const ahead = await count(`${upstream}..HEAD`);
+    const behind = await count(`HEAD..${upstream}`);
+    const head = await this._head();
+    const dirty = (await g(['status', '--porcelain=v1', '--untracked-files=no'])).stdout.split('\n').filter(Boolean).map(l => l.slice(3));
+
+    if (strategy === 'reset') {
+      if (confirm !== head) {
+        throw new Error(`reset discards local work; pass confirm: "${head}" (the current local HEAD) after reviewing the sync_project report.`);
+      }
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const backups = [`mcp-backup/${stamp}`];
+      await g(['tag', backups[0], head]);
+      if (dirty.length) {
+        // stash create snapshots uncommitted tracked edits as a commit without
+        // touching the working tree; the tag keeps it reachable.
+        const wip = (await g(['stash', 'create', `mcp-backup ${stamp}`])).stdout.trim();
+        if (wip) { backups.push(`mcp-backup/${stamp}-wip`); await g(['tag', backups[1], wip]); }
+      }
+      await g(['reset', '--hard', upstream]);
+      return { state: 'reset', discardedCommits: ahead, discardedFiles: dirty, backups, ...(await this.pendingState()) };
+    }
+
+    if (behind === 0) return { state: ahead ? 'ahead' : 'up-to-date', ahead, behind, head, dirtyFiles: dirty };
+    if (ahead === 0) {
+      await g(['merge', '--ff-only', upstream]);
+      return { state: 'fast-forwarded', ahead, behind, ...(await this.pendingState()) };
+    }
+
+    const log = async range => (await g(['log', '--format=%h %s', '--name-only', range])).stdout.trim();
+    const report = {
+      state: 'diverged', ahead, behind, head, upstream: (await g(['rev-parse', upstream])).stdout.trim(),
+      localCommits: await log(`${upstream}..HEAD`), remoteCommits: await log(`HEAD..${upstream}`), dirtyFiles: dirty,
+      options: 'strategy:"rebase" replays local commits onto Overleaf (aborts cleanly on conflict); strategy:"reset" with confirm:<head> discards local work after tagging a backup.',
+    };
+    if (strategy !== 'rebase') return report;
+    if (dirty.length) throw new Error(`rebase needs a clean working tree; uncommitted edits in: ${dirty.join(', ')}. Commit them or choose reset.`);
+    try {
+      await g(['rebase', upstream]);
+    } catch {
+      const conflicts = (await g(['diff', '--name-only', '--diff-filter=U']).catch(() => ({ stdout: '' }))).stdout.trim().split('\n').filter(Boolean);
+      await g(['rebase', '--abort']).catch(() => {});
+      return { ...report, state: 'rebase-conflict', conflicts, note: 'Rebase aborted; local state is unchanged.' };
+    }
+    return { state: 'rebased', ...(await this.pendingState()) };
   }
 
+  // options.lint (true = every .tex file, or an array of paths) adds the voice
+  // linter to the gate: findings fail it like an undefined reference does.
+  // Lint runs outside the build cache, so a reused build verdict is never
+  // mutated and lint always sees the current files.
   async verifyBuild(filePath, engine = 'lualatex', options = {}) {
     const key = path.resolve(this.repoPath);
     const previous = buildQueues.get(key) || Promise.resolve();
     const task = previous.catch(() => {}).then(() => this._verifyLocal(filePath, engine, options));
     buildQueues.set(key, task);
-    try { return await task; } finally { if (buildQueues.get(key) === task) buildQueues.delete(key); }
+    let verdict;
+    try { verdict = await task; } finally { if (buildQueues.get(key) === task) buildQueues.delete(key); }
+    if (!options.lint) return verdict;
+    const files = Array.isArray(options.lint) ? options.lint : await this.listFiles('.tex');
+    const lint = await this.lintFiles(files, options.lintCommand);
+    return { ...verdict, lint, pass: verdict.pass && lint.clean };
+  }
+
+  async lintFiles(files, command) {
+    const results = [];
+    for (const file of files) results.push({ file, ...(await this.voiceLint(file, { command })) });
+    return { clean: results.every(r => r.clean), results };
   }
 
   async _verifyLocal(filePath, engine, options = {}) {
@@ -493,29 +639,23 @@ class OverleafGitClient {
     }
   }
 
-  // Append a BibTeX entry to refs.bib (reject a duplicate key), commit, push.
-  async addCitation({ entry, commitMessage } = {}) {
+  // Append a BibTeX entry to refs.bib (reject a duplicate key), commit, and
+  // push when push is true.
+  async addCitation({ entry, commitMessage, push = true } = {}) {
     if (!entry || !entry.trim()) throw new Error('add_citation needs a BibTeX entry.');
     const m = entry.match(/@\w+\s*\{\s*([^,\s]+)/);
     if (!m) throw new Error('Could not find a BibTeX key in the entry (expected @type{key, ...}).');
     const key = m[1];
-    await this.cloneOrPull();
+    const preHead = await this._prepareMutation(push);
     const bibPath = path.join(this.repoPath, 'refs.bib');
     let current = '';
     try { current = await readFile(bibPath, 'utf-8'); } catch { /* missing -> create */ }
     const dup = new RegExp(`@\\w+\\s*\\{\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*,`);
     if (dup.test(current)) throw new Error(`citation key "${key}" already in refs.bib.`);
     await writeFile(bibPath, current.replace(/\s*$/, '') + '\n\n' + entry.trim() + '\n', 'utf-8');
-    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
-    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
     await this._git(['-C', this.repoPath, 'add', '--', 'refs.bib']);
-    try {
-      await this._git(['-C', this.repoPath, 'commit', '-m', commitMessage || `Add citation ${key}`]);
-    } catch (e) {
-      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) return { pushed: false, reason: 'nothing to commit', key };
-      throw e;
-    }
-    return { ...(await this._pushWithMerge()), key };
+    if (!(await this._commit(commitMessage || `Add citation ${key}`))) return { pushed: false, reason: 'nothing to commit', key };
+    return { ...(await this._finishMutation(preHead, push, { merge: true })), key };
   }
 
   // Read-only: cited keys (across .tex) vs defined keys (refs.bib).
@@ -554,7 +694,7 @@ class OverleafGitClient {
 
   // Local rollback point: a lightweight tag mcp-snap/<label> at HEAD (not pushed).
   async checkpoint(label) {
-    await this.cloneOrPull();
+    await this.requireLocal();
     const name = `mcp-snap/${(label && label.trim()) || `snap-${Date.now()}`}`;
     let exists = false;
     try { await this._git(['-C', this.repoPath, 'rev-parse', '--verify', '--quiet', `refs/tags/${name}`]); exists = true; } catch { exists = false; }
@@ -564,10 +704,12 @@ class OverleafGitClient {
     return { label: name, head: stdout.trim() };
   }
 
-  // Forward-restore the snapshot's tree as a new commit on top of HEAD, then push.
-  // No history rewrite, no force-push (the new commit descends from HEAD).
-  async restore(label) {
-    await this.cloneOrPull();
+  // Forward-restore the snapshot's tree as a new commit on top of HEAD, pushed
+  // when push is true. No history rewrite, no force-push (the new commit
+  // descends from HEAD). The fast-forward refuses rather than overwriting
+  // uncommitted local edits to files the restore would change.
+  async restore(label, { push = true } = {}) {
+    const preHead = await this._prepareMutation(push);
     const name = String(label || '').startsWith('mcp-snap/') ? label : `mcp-snap/${label}`;
     let tree;
     try { ({ stdout: tree } = await this._git(['-C', this.repoPath, 'rev-parse', `${name}^{tree}`])); }
@@ -576,19 +718,10 @@ class OverleafGitClient {
       throw new Error(`snapshot "${name}" not found. Available: ${tags || '(none)'}`);
     }
     tree = tree.trim();
-    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
-    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
     const { stdout: commit } = await this._git(['-C', this.repoPath, 'commit-tree', tree, '-p', 'HEAD', '-m', `restore: ${name}`]);
-    await this._git(['-C', this.repoPath, 'reset', '--hard', commit.trim()]);
-    try {
-      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
-    } catch (e) {
-      const branch = await this._currentBranch();
-      await this._git(['-C', this.repoPath, 'fetch', 'origin'], { auth: true }).catch(() => {});
-      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
-      throw new Error(`restore: Overleaf moved during the rollback; refused. Re-run after re-pulling. (${(e.stderr || e.message || '').slice(0, 120)})`);
-    }
-    return { pushed: true, label: name, restoredTo: tree };
+    await this._git(['-C', this.repoPath, 'merge', '--ff-only', commit.trim()]);
+    const res = await this._finishMutation(preHead, push, { refusal: 'restore: Overleaf moved during the rollback; refused. Run sync_project, then retry.' });
+    return { ...res, label: name, restoredTo: tree };
   }
 
   // Run the configured voice linter on a file; advisory, read-only.
@@ -640,9 +773,11 @@ class OverleafGitClient {
   }
 
   // Push origin HEAD. If the remote moved during the op (non-fast-forward),
-  // let git 3-way merge it: clean merge -> push; real conflict -> abort, reset
-  // to the remote tip, and throw (so nothing half-applied is left behind).
-  async _pushWithMerge() {
+  // let git 3-way merge it: clean merge -> push; real conflict -> abort, roll
+  // back to preHead (the state before this operation's commit), and throw, so
+  // nothing half-applied is left behind and earlier local commits survive.
+  async _pushWithMerge(preHead) {
+    if (!preHead) throw new Error('_pushWithMerge needs the pre-operation HEAD to roll back to.');
     try {
       await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
       return { pushed: true, merged: false };
@@ -653,15 +788,15 @@ class OverleafGitClient {
         await this._git(['-C', this.repoPath, 'merge', '--no-edit', `origin/${branch}`]);
       } catch (mergeErr) {
         await this._git(['-C', this.repoPath, 'merge', '--abort']).catch(() => {});
-        await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]);
-        const e = new Error('conflict: the file changed on Overleaf in a way that overlaps this edit. Re-read the file and retry.');
+        await this._git(['-C', this.repoPath, 'reset', '--hard', preHead]);
+        const e = new Error('conflict: the file changed on Overleaf in a way that overlaps this edit. Run sync_project, re-read the file and retry.');
         e.cause = mergeErr;
         throw e;
       }
       try {
         await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
       } catch (e2) {
-        await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
+        await this._git(['-C', this.repoPath, 'reset', '--hard', preHead]).catch(() => {});
         const e = new Error('conflict: Overleaf moved again while merging; reset clean — re-read the file and retry.');
         e.cause = e2;
         throw e;
@@ -674,10 +809,10 @@ class OverleafGitClient {
   // files: require either a matching baseSha (proves freshness) or overwrite:true
   // (a deliberate clobber). A stale baseSha is refused, never merged.
   async writeFile(filePath, content, opts = {}) {
-    const { baseSha, overwrite = false, commitMessage } = opts;
-    await this.cloneOrPull();
+    const { baseSha, overwrite = false, commitMessage, push = true } = opts;
+    const preHead = await this._prepareMutation(push);
     const fullPath = path.join(this.repoPath, filePath);
-    const current = await this.getBlobSha(filePath, { pull: false }); // null if new
+    const current = await this.getBlobSha(filePath); // null if new
 
     if (current !== null) {
       if (baseSha != null) {
@@ -691,28 +826,10 @@ class OverleafGitClient {
 
     await mkdir(path.dirname(fullPath), { recursive: true });
     await writeFile(fullPath, content, 'utf-8');
-    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
-    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
     await this._git(['-C', this.repoPath, 'add', '--', filePath]);
-    try {
-      await this._git(['-C', this.repoPath, 'commit', '-m', commitMessage || `Update ${filePath} via Claude`]);
-    } catch (e) {
-      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) {
-        return { pushed: false, reason: 'nothing to commit' };
-      }
-      throw e;
-    }
+    if (!(await this._commit(commitMessage || `Update ${filePath} via Claude`))) return { pushed: false, reason: 'nothing to commit' };
     // write_file refuses on a push race rather than merging (conflict-refuse policy).
-    try {
-      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
-    } catch (e) {
-      const branch = await this._currentBranch();
-      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
-      await this._git(['-C', this.repoPath, 'fetch', 'origin'], { auth: true }).catch(() => {});
-      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
-      throw new Error(`${filePath}: Overleaf moved while writing; refused to overwrite. Re-read and retry. (${(e.stderr || e.message || '').slice(0, 120)})`);
-    }
-    return { pushed: true };
+    return this._finishMutation(preHead, push, { refusal: `${filePath}: Overleaf moved while writing; refused to overwrite. Run sync_project, re-read and retry.` });
   }
 
   // Upload binary file(s) from local disk into the clone and push. Single mode:
@@ -721,7 +838,7 @@ class OverleafGitClient {
   // Binary never 3-way-merges, so a push race refuses + resets like writeFile.
   // baseSha freshness applies in single mode only; existing files in batch mode
   // require overwrite:true.
-  async uploadFile({ srcPath, destPath, files, baseSha, overwrite = false, commitMessage } = {}) {
+  async uploadFile({ srcPath, destPath, files, baseSha, overwrite = false, commitMessage, push = true } = {}) {
     let pairs;
     const batch = Array.isArray(files);
     if (batch) {
@@ -734,7 +851,7 @@ class OverleafGitClient {
       throw new Error('upload_file needs srcPath+destPath (single) or files:[{srcPath,destPath}] (batch).');
     }
 
-    await this.cloneOrPull();
+    const preHead = await this._prepareMutation(push);
     const repoAbs = path.resolve(this.repoPath);
     const resolved = [];
     for (const { src, dest } of pairs) {
@@ -746,7 +863,7 @@ class OverleafGitClient {
       if (destAbs === repoAbs || rel.startsWith('..') || path.isAbsolute(rel) || rel.split(path.sep)[0] === '.git') {
         throw new Error(`destPath escapes the project or is not allowed: ${dest}`);
       }
-      const current = await this.getBlobSha(rel, { pull: false });
+      const current = await this.getBlobSha(rel);
       if (current !== null) {
         if (!batch && baseSha != null) {
           if (baseSha !== current) {
@@ -764,34 +881,21 @@ class OverleafGitClient {
       await copyFile(src, destAbs);
     }
 
-    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
-    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
-    await this._git(['-C', this.repoPath, 'add', '--', ...resolved.map(r => r.rel)]);
-    try {
-      await this._git(['-C', this.repoPath, 'commit', '-m', commitMessage || `Upload ${resolved.length} file(s) via Claude`]);
-    } catch (e) {
-      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) {
-        return { pushed: false, reason: 'nothing to commit (identical to repo)', files: resolved.map(r => r.rel) };
-      }
-      throw e;
+    const rels = resolved.map(r => r.rel);
+    await this._git(['-C', this.repoPath, 'add', '--', ...rels]);
+    if (!(await this._commit(commitMessage || `Upload ${resolved.length} file(s) via Claude`))) {
+      return { pushed: false, reason: 'nothing to commit (identical to repo)', files: rels };
     }
-    try {
-      await this._git(['-C', this.repoPath, 'push', 'origin', 'HEAD'], { auth: true });
-    } catch (e) {
-      const branch = await this._currentBranch();
-      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
-      await this._git(['-C', this.repoPath, 'fetch', 'origin'], { auth: true }).catch(() => {});
-      await this._git(['-C', this.repoPath, 'reset', '--hard', `origin/${branch}`]).catch(() => {});
-      throw new Error(`Overleaf moved while uploading; refused. Re-read and retry. (${(e.stderr || e.message || '').slice(0, 120)})`);
-    }
-    return { pushed: true, files: resolved.map(r => r.rel) };
+    const res = await this._finishMutation(preHead, push, { refusal: 'Overleaf moved while uploading; refused. Run sync_project and retry.' });
+    return { ...res, files: rels };
   }
 
-  // Anchored, conflict-safe edit. Pulls first (absorbing non-overlapping Overleaf
-  // edits), then replaces oldString. A missing anchor means the user changed that
-  // region (overlap) or the string was wrong -> refuse, nothing written.
-  async editFile(filePath, oldString, newString, replaceAll = false, commitMessage) {
-    await this.cloneOrPull();
+  // Anchored, conflict-safe edit. When pushing, pulls first (absorbing
+  // non-overlapping Overleaf edits); local-only edits never touch the network.
+  // A missing anchor means the region changed (overlap) or the string was
+  // wrong -> refuse, nothing written.
+  async editFile(filePath, oldString, newString, replaceAll = false, commitMessage, { push = true } = {}) {
+    const preHead = await this._prepareMutation(push);
     const fullPath = path.join(this.repoPath, filePath);
     let content;
     try { content = await readFile(fullPath, 'utf-8'); }
@@ -807,38 +911,38 @@ class OverleafGitClient {
     }
     const updated = replaceAll ? parts.join(newString) : content.replace(oldString, () => newString);
     await writeFile(fullPath, updated, 'utf-8');
-
-    await this._git(['-C', this.repoPath, 'config', 'user.email', 'claude@anthropic.com']);
-    await this._git(['-C', this.repoPath, 'config', 'user.name', 'Claude']);
     await this._git(['-C', this.repoPath, 'add', '--', filePath]);
-    try {
-      await this._git(['-C', this.repoPath, 'commit', '-m', commitMessage || `Edit ${filePath} via Claude`]);
-    } catch (e) {
-      if (/nothing to commit/i.test((e.stdout || '') + (e.stderr || ''))) {
-        return { pushed: false, reason: 'no change (new === old)' };
-      }
-      throw e;
-    }
-    return await this._pushWithMerge();
+    if (!(await this._commit(commitMessage || `Edit ${filePath} via Claude`))) return { pushed: false, reason: 'no change (new === old)' };
+    return this._finishMutation(preHead, push, { merge: true });
   }
 
+  // Same slicing as the bundle (sectionText): runs to the next heading of the
+  // same or higher level, covers \paragraph, and refuses an ambiguous title
+  // rather than silently returning the first match.
   async getSectionContent(filePath, sectionTitle) {
-    const content = await this.readFile(filePath);
-    const sections = await this.getSections(filePath);
-    const target = sections.find(s => s.title === sectionTitle);
-    if (!target) {
-      throw new Error(`Section "${sectionTitle}" not found`);
-    }
-    // The body runs until the next heading of the SAME or HIGHER level, so a
-    // \section keeps its \subsections instead of being cut at the first one.
-    const rank = { section: 1, subsection: 2, subsubsection: 3 };
-    const next = sections.find(s => s.index > target.index && rank[s.type] <= rank[target.type]);
-    const endIdx = next ? next.index : content.length;
-    return content.substring(target.index, endIdx);
+    return sectionText(await this.readFile(filePath), sectionTitle);
   }
 }
 
 export { OverleafGitClient };
+
+// settings.voiceLinter / $OVERLEAF_VOICE_LINTER override the bundled example
+// linter, which ships with the package so voice_lint works out of the box. The
+// example implements generic prose checks; point the setting at your own
+// command to enforce a house style.
+function voiceLinterCommand(config) {
+  return config.settings?.voiceLinter
+    || process.env.OVERLEAF_VOICE_LINTER
+    || `node ${path.join(PACKAGE_DIR, 'examples', 'voice-lint.mjs')}`;
+}
+
+// What a mutating tool reports: pushed, or committed locally with the count of
+// commits still waiting for publish_changes.
+function mutationTail(res, what) {
+  if (res.pushed) return `${what} and pushed to Overleaf${res.merged ? ' (auto-merged a concurrent Overleaf change)' : ''}.`;
+  const n = res.unpublished == null ? 'unknown' : res.unpublished;
+  return `${what} and committed locally (HEAD ${res.head.slice(0, 12)}; ${n} unpublished commit(s)). NEXT: finish the batch, verify_build, then publish_changes with revision ${res.head} once publishing is authorized.`;
+}
 
 async function getClient(projectName) {
   const config = await loadConfig();
@@ -1013,8 +1117,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       ['change_report', 'Compact local file and section changes against an in-process baseline. Omit baselineVersion to establish one.', { baselineVersion: { type: 'string' } }, []],
       ['render_pages', 'Render explicitly selected PDF pages to cached local PNG paths. Pages are one-based; no sync or build.', { filePath: { type: 'string' }, pages: { type: 'array', items: { type: 'integer', minimum: 1 }, minItems: 1, maxItems: 20 }, dpi: { type: 'integer', minimum: 36, maximum: 300 } }, ['filePath', 'pages']],
       ['usage_stats', 'In-process tool counts, durations, response bytes and cache hits. Stores no document content. Bytes are not billed tokens.', { reset: { type: 'boolean' } }, []],
-      ['apply_changes', 'Verify a UTF-8 multi-file batch in an isolated worktree, then commit it locally. Requires clean tracked source, HEAD baseRevision and SHA-256 baseHash per file (null for new files). No push.', { baseRevision: { type: 'string' }, changes: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'object', properties: { filePath: { type: 'string' }, baseHash: { type: ['string', 'null'] }, content: { type: 'string' } }, required: ['filePath', 'baseHash', 'content'] } }, filePath: { type: 'string' }, engine: { type: 'string' }, controlled: { type: 'boolean' }, externalInputs: { type: 'array', items: { type: 'string' } } }, ['baseRevision', 'changes', 'filePath']],
-      ['publish_changes', 'Explicitly verify the unchanged local revision and push once. No pull, retry, merge or reset. Requires publishing authorization.', { revision: { type: 'string' }, filePath: { type: 'string' }, engine: { type: 'string' }, controlled: { type: 'boolean' }, externalInputs: { type: 'array', items: { type: 'string' } } }, ['revision', 'filePath']],
+      ['apply_changes', 'Verify a UTF-8 multi-file batch in an isolated worktree, then commit it locally. Requires clean tracked source, HEAD baseRevision and SHA-256 baseHash per file (null for new files). No push.', { baseRevision: { type: 'string' }, changes: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'object', properties: { filePath: { type: 'string' }, baseHash: { type: ['string', 'null'] }, content: { type: 'string' } }, required: ['filePath', 'baseHash', 'content'] } }, filePath: { type: 'string' }, engine: { type: 'string' }, controlled: { type: 'boolean' }, externalInputs: { type: 'array', items: { type: 'string' } }, lint: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] } }, ['baseRevision', 'changes', 'filePath']],
+      ['publish_changes', 'Verify the clean local HEAD and push it once, publishing every unpublished local commit (from apply_changes or local-mode edit tools) together. revision must equal HEAD. No pull, retry, merge or reset; if Overleaf moved, run sync_project first. Requires publishing authorization.', { revision: { type: 'string' }, filePath: { type: 'string' }, engine: { type: 'string' }, controlled: { type: 'boolean' }, externalInputs: { type: 'array', items: { type: 'string' } }, lint: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] } }, ['revision', 'filePath']],
     ].map(([name, description, properties, required]) => ({ name, description, inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, ...properties }, required } })),
     {
       name: 'get_context',
@@ -1063,7 +1167,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'configure',
-      description: 'Set up or update overleaf-forge\'s global settings: the scaffold templates directory, the voice_lint command, and the recurring-work settings bootstrap_ssa uses (academic root, SSA subdir, default clone dir). FIRST call this with NO arguments to see the current settings and which are unset, with a question for each; ask the user those questions in turn; THEN call it again with their answers to write them to projects.json. Omit a field to leave it unchanged; pass an empty string to clear it back to the bundled default. The git token is redacted in all output. Intended right after install to configure the server conversationally.',
+      description: 'Set up or update overleaf-forge\'s global settings: the scaffold templates directory, the voice_lint command, the edit push policy (autoPush), and the recurring-work settings bootstrap_ssa uses (academic root, SSA subdir, default clone dir). FIRST call this with NO arguments to see the current settings and which are unset, with a question for each; ask the user those questions in turn; THEN call it again with their answers to write them to projects.json. Omit a field to leave it unchanged; pass an empty string to clear it back to the bundled default. The git token is redacted in all output. Intended right after install to configure the server conversationally.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1072,6 +1176,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           ssaSubdir: { type: 'string', description: 'Subfolder name created under each course folder for new SSAs, e.g. "MY SSAs".' },
           templatesDir: { type: 'string', description: 'Directory of your scaffold templates (main.tex, context-scaffold.md), overriding the bundled examples. ~ expanded. Empty string reverts to bundled.' },
           voiceLinter: { type: 'string', description: 'Prose-linter command for voice_lint (takes a file path, exits non-zero on findings), overriding the bundled example. Empty string reverts to bundled.' },
+          autoPush: { type: 'boolean', description: 'true: edit tools push immediately. false (default): they commit locally and publish_changes sends the verified batch.' },
           gitToken: { type: 'string', description: 'Overleaf git token. Prefer the OVERLEAF_GIT_TOKEN env var; set here only to store it in projects.json.' },
         },
       },
@@ -1153,50 +1258,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'sync_project',
-      description: 'Explicitly clone or fast-forward pull the selected project. Refuses conflicts; never hard-resets local edits. Builds do not sync.',
-      inputSchema: { type: 'object', properties: { projectName: { type: 'string' } } },
-    },
-    {
-      name: 'get_section_bundle',
-      description: 'Read a local section with directly referenced equation/figure blocks, bibliography entries and asset paths. No pull. Reports unresolved references and truncation; not a recursive TeX parser.',
-      inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, filePath: { type: 'string' }, sectionTitle: { type: 'string' }, maxChars: { type: 'integer', minimum: 2000, maximum: 64000 } }, required: ['filePath','sectionTitle'] },
+      description: 'Fetch Overleaf and reconcile the local clone. Fast-forwards when only behind; reports unpublished local commits when ahead. On divergence it changes nothing and returns both sides, unless strategy is given: "rebase" replays local commits onto Overleaf (aborts cleanly on conflict); "reset" discards local work to match Overleaf, requires confirm set to the reported local head, and tags mcp-backup/* first. Clones when no local copy exists. Builds and reads never sync.',
+      inputSchema: { type: 'object', properties: {
+        strategy: { type: 'string', enum: ['rebase', 'reset'], description: 'Only for a diverged clone. Omit to get the report first.' },
+        confirm: { type: 'string', description: 'For strategy "reset": the full local head SHA from the report.' },
+        projectName: { type: 'string' },
+      } },
     },
     {
       name: 'get_section_content',
-      description: 'Get the body of a single section by title.',
+      description: 'Read one section (\\section to \\paragraph) by exact title from the local clone; no pull. The title must be unique in the file. bundle:true also returns the equation/figure blocks it references, matching bibliography entries and asset paths as JSON, reporting unresolved references and truncation (not a recursive TeX parser).',
       inputSchema: {
         type: 'object',
         properties: {
           filePath: { type: 'string' },
           sectionTitle: { type: 'string' },
+          bundle: { type: 'boolean', default: false, description: 'Include referenced blocks, bibliography entries and assets.' },
+          maxChars: { type: 'integer', minimum: 2000, maximum: 64000, description: 'bundle only: response budget (default 16000).' },
           projectName: { type: 'string' },
         },
         required: ['filePath', 'sectionTitle'],
       },
     },
     {
-      name: 'compile_file',
-      description: 'Compile a .tex file locally with LuaLaTeX (default), XeLaTeX, or pdfLaTeX. Local only; no pull. Compact verdict by default, verbose adds a log tail. Use for intermediate layout checks; verify_build provides the final gate.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          controlled: { type: 'boolean', default: false, description: 'Ignore all latexmk rc files and disable shell escape. Opt in only when the project supports this mode.' },
-          externalInputs: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of additional build inputs to hash.' },
-          verbose: { type: 'boolean', default: false, description: 'Include a bounded log tail; full log remains on disk.' },
-          force: { type: 'boolean', default: false, description: 'Ignore a cached verification and rebuild.' },
-          filePath: { type: 'string' },
-          engine: { type: 'string', description: 'pdflatex | xelatex | lualatex (default lualatex)' },
-          projectName: { type: 'string' },
-        },
-        required: ['filePath'],
-      },
-    },
-    {
       name: 'verify_build',
-      description: 'Verify the local entrypoint, reusing an unchanged eligible successful build unless force is true; otherwise compile from scratch and return a PASS/FAIL verdict on the done-bar: PASS only if a PDF is produced with zero LaTeX errors, zero undefined references, and zero undefined citations. Reports page count; overfull/underfull boxes are warnings, not failures. Use as the final gate before declaring a writing task done.',
+      description: 'Build the local entrypoint and return a PASS/FAIL verdict on the done-bar: PASS only if a PDF is produced with zero LaTeX errors, zero undefined references and zero undefined citations (and, with lint, zero voice-linter findings). Reports page count; overfull/underfull boxes are warnings. Default is the final gate: a clean from-scratch build, reusing an unchanged eligible PASS unless force is true. clean:false is a quick incremental rebuild for intermediate layout checks. Local only; no pull.',
       inputSchema: {
         type: 'object',
         properties: {
+          clean: { type: 'boolean', default: true, description: 'false = quick incremental rebuild that always recompiles (intermediate checks); true = from-scratch final gate.' },
+          lint: { description: 'Also run the voice linter as part of the gate: true for every .tex file, or an array of paths. Findings fail the verdict.', anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] },
           controlled: { type: 'boolean', default: false, description: 'Ignore all latexmk rc files and disable shell escape. Opt in only when the project supports this mode.' },
           externalInputs: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of additional build inputs to hash.' },
           verbose: { type: 'boolean', default: false, description: 'Include a bounded log tail; full log remains on disk.' },
@@ -1210,7 +1301,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'edit_file',
-      description: 'Surgical, conflict-safe edit: replace oldString with newString in a file, then commit and push. PREFER this over write_file for edits to existing files — it is far cheaper than a full rewrite and it cannot silently clobber a concurrent Overleaf edit (a missing oldString means the region changed; the edit refuses). Non-overlapping concurrent edits auto-merge. oldString must match exactly once unless replaceAll is true. After the edit batch, use verify_build as the single final gate.',
+      description: 'Surgical, conflict-safe edit: replace oldString with newString in a file and commit. Commits locally by default (push:false unless settings.autoPush); publish_changes sends the verified batch. PREFER this over write_file for edits to existing files — it is far cheaper than a full rewrite and it cannot silently clobber a concurrent Overleaf edit (a missing oldString means the region changed; the edit refuses). When pushing, non-overlapping concurrent Overleaf edits auto-merge. oldString must match exactly once unless replaceAll is true. After the edit batch, use verify_build as the single final gate.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1219,6 +1310,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           newString: { type: 'string', description: 'Replacement text.' },
           replaceAll: { type: 'boolean', description: 'Replace every occurrence (default false; otherwise oldString must be unique).' },
           commitMessage: { type: 'string' },
+          push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' },
           projectName: { type: 'string' },
         },
         required: ['filePath', 'oldString', 'newString'],
@@ -1226,7 +1318,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'write_file',
-      description: 'Create a new file, or overwrite an existing one wholesale, then push. For edits to existing files prefer edit_file. Overwriting an existing file requires either baseSha (from read_file, so a stale write is refused) or overwrite:true. After the edit batch, use verify_build as the single final gate.',
+      description: 'Create a new file, or overwrite an existing one wholesale, and commit (local by default; see push). For edits to existing files prefer edit_file. Overwriting an existing file requires either baseSha (from read_file, so a stale write is refused) or overwrite:true. After the edit batch, use verify_build as the single final gate.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1235,6 +1327,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           baseSha: { type: 'string', description: 'The baseSha from read_file for this file. Required to overwrite an existing file safely; if Overleaf moved since, the write is refused.' },
           overwrite: { type: 'boolean', description: 'Force-overwrite an existing file without a baseSha (deliberate full replacement). Ignored for new files.' },
           commitMessage: { type: 'string' },
+          push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' },
           projectName: { type: 'string' },
         },
         required: ['filePath', 'content'],
@@ -1242,7 +1335,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'upload_file',
-      description: 'Upload a binary file (PNG/PDF figure, etc.) from a local disk path INTO the Overleaf project and push. write_file/edit_file are UTF-8 only — use this for binaries. Single: srcPath + destPath. Batch (one commit for a figure set): files: [{srcPath, destPath}, ...]. Existing dest files need baseSha (single mode, from read_file) or overwrite:true. After uploading, reference each figure with \\includegraphics{...} via edit_file, then compile_file.',
+      description: 'Upload a binary file (PNG/PDF figure, etc.) from a local disk path INTO the Overleaf project and commit (local by default; see push). write_file/edit_file are UTF-8 only — use this for binaries. Single: srcPath + destPath. Batch (one commit for a figure set): files: [{srcPath, destPath}, ...]. Existing dest files need baseSha (single mode, from read_file) or overwrite:true. After uploading, reference each figure with \\includegraphics{...} via edit_file, then verify_build.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1256,6 +1349,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           baseSha: { type: 'string', description: 'Single-file mode only: baseSha from read_file; a stale value is refused. Ignored in batch.' },
           overwrite: { type: 'boolean', description: 'Replace existing dest file(s). Required to overwrite in batch mode.' },
           commitMessage: { type: 'string' },
+          push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' },
           projectName: { type: 'string' },
         },
       },
@@ -1277,12 +1371,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'add_citation',
-      description: 'Append a BibTeX entry (raw @type{key, ...} string) to refs.bib and push. Refuses if the key already exists. Creates refs.bib if absent.',
+      description: 'Append a BibTeX entry (raw @type{key, ...} string) to refs.bib and commit (local by default; see push). Refuses if the key already exists. Creates refs.bib if absent.',
       inputSchema: {
         type: 'object',
         properties: {
           entry: { type: 'string', description: 'A complete BibTeX entry, e.g. @article{key, title={...}, ...}.' },
           commitMessage: { type: 'string' },
+          push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' },
           projectName: { type: 'string' },
         },
         required: ['entry'],
@@ -1300,12 +1395,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'restore',
-      description: 'Roll back to a checkpoint: re-applies the snapshot\'s file tree as a NEW commit on top of history and pushes (no force-push, no history rewrite). Overleaf reflects the rollback; intervening commits are preserved.',
-      inputSchema: { type: 'object', properties: { label: { type: 'string' }, projectName: { type: 'string' } }, required: ['label'] },
+      description: 'Roll back to a checkpoint: re-applies the snapshot\'s file tree as a NEW commit on top of history (no force-push, no history rewrite); intervening commits are preserved. Local by default; see push.',
+      inputSchema: { type: 'object', properties: { label: { type: 'string' }, push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' }, projectName: { type: 'string' } }, required: ['label'] },
     },
     {
       name: 'voice_lint',
-      description: 'Lint a .tex file for prose issues. Runs a bundled generic example linter by default; override with settings.voiceLinter in projects.json or the OVERLEAF_VOICE_LINTER env var (a command that takes a file path and exits non-zero on findings). Lints the LOCAL working copy as-is and never pulls, so it reflects on-disk state including edits not yet pushed; if the project has not been cloned locally yet it errors rather than fetching. Read-only and advisory: reports output, never blocks. Useful after editing prose via edit_file/write_file, which bypass any local editor hooks.',
+      description: 'Lint a .tex file for prose issues. Runs a bundled generic example linter by default; override with settings.voiceLinter in projects.json or the OVERLEAF_VOICE_LINTER env var (a command that takes a file path and exits non-zero on findings). Lints the LOCAL working copy as-is and never pulls, so it reflects on-disk state including edits not yet pushed; if the project has not been cloned locally yet it errors rather than fetching. Read-only and advisory on its own; verify_build with lint makes findings fail the final gate. Useful after editing prose via edit_file/write_file, which bypass any local editor hooks.',
       inputSchema: {
         type: 'object',
         properties: { filePath: { type: 'string' }, projectName: { type: 'string' } },
@@ -1612,13 +1707,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeTool(r
 
       case 'get_section_content': {
         const { client } = await getClient(args.projectName);
+        if (args.bundle) {
+          await client.requireLocal();
+          const result = await sectionBundle(client.repoPath, args.filePath, args.sectionTitle, args.maxChars);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
+        }
         const content = await client.getSectionContent(args.filePath, args.sectionTitle);
         return { content: [{ type: 'text', text: content }] };
       }
 
       case 'sync_project': {
         const { client } = await getClient(args.projectName);
-        return { content: [{ type:'text',text:await client.syncProject() }] };
+        const result = await client.syncProject({ strategy: args.strategy, confirm: args.confirm });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], structuredContent: result };
       }
       case 'usage_stats': {
         const result = usageStats(args);
@@ -1636,6 +1737,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeTool(r
       }
       case 'apply_changes':
       case 'publish_changes': {
+        const config = await loadConfig();
         const { client } = await getClient(args.projectName);
         await client.requireLocal();
         const verify = async root => {
@@ -1643,59 +1745,71 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeTool(r
           return candidate.verifyBuild(args.filePath, args.engine || 'lualatex', {
             controlled: args.controlled === true,
             externalInputs: args.externalInputs,
+            lint: args.lint,
+            lintCommand: voiceLinterCommand(config),
           });
         };
         const result = name === 'apply_changes' ? await applyChanges(client.repoPath, args, verify)
           : await publishChanges(client.repoPath, args, verify, async (root, revision, branch) => {
-            await client._git(['-C', root, 'push', 'origin', `${revision}:refs/heads/${branch}`], { auth: true });
+            try {
+              await client._git(['-C', root, 'push', 'origin', `${revision}:refs/heads/${branch}`], { auth: true });
+            } catch (e) {
+              // A rejected push means Overleaf moved since the last sync; name
+              // the recovery instead of surfacing raw git plumbing.
+              if (/rejected|fetch first|non-fast-forward/i.test(e.stderr || '')) {
+                throw new Error('Overleaf has commits this clone lacks, so the push was refused and nothing was published. Run sync_project to see both sides, resolve with strategy "rebase", verify again, then publish the new HEAD.');
+              }
+              throw e;
+            }
           });
         return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
       }
-      case 'get_section_bundle': {
-        const { client } = await getClient(args.projectName);
-        await client.requireLocal();
-        const result = await sectionBundle(client.repoPath,args.filePath,args.sectionTitle,args.maxChars);
-        return { content: [{type:'text',text:JSON.stringify(result)}] };
-      }
-      case 'compile_file':
       case 'verify_build': {
+        const config = await loadConfig();
         const { client } = await getClient(args.projectName);
-        const v = name === 'compile_file'
-          ? await client.compileFile(args.filePath,args.engine || 'lualatex',args)
-          : await client.verifyBuild(args.filePath,args.engine || 'lualatex',args);
+        const opts = { ...args, lintCommand: voiceLinterCommand(config) };
+        const v = args.clean === false
+          ? await client.compileFile(args.filePath, args.engine || 'lualatex', opts)
+          : await client.verifyBuild(args.filePath, args.engine || 'lualatex', opts);
         const parts = [`${v.pass ? 'PASS' : 'FAIL'}: ${v.pageCount ?? '?'} pages; ${v.errors.length} errors; ${v.undefinedRefs.length} undefined references; ${v.undefinedCitations.length} undefined citations; ${v.overfullCount} overfull / ${v.underfullCount} underfull boxes.`,
           `Reused verification: ${v.reused}. Full log: ${v.logPath}`];
         if (!v.pass) parts.push(...v.errors.slice(0,5),...v.undefinedRefs.slice(0,5),...v.undefinedCitations.slice(0,5));
+        if (v.lint) parts.push(v.lint.clean ? `Voice lint: clean (${v.lint.results.length} file(s)).` : `Voice lint findings:\n${v.lint.results.filter(r => !r.clean).map(r => `${r.file}:\n${r.findings}`).join('\n')}`);
         if (args.verbose) parts.push(v.tail);
         if (!v.cacheEligible && !v.reused) parts.push('Cache not retained: dependency closure unavailable, executable configuration, or changing inputs.');
-        return { content:[{type:'text',text:parts.join('\n')}], structuredContent: { pass: v.pass, pageCount: v.pageCount, reused: v.reused, cacheEligible: v.cacheEligible, errors: v.errors.slice(0,5), logPath: v.logPath } };
+        return { content:[{type:'text',text:parts.join('\n')}], structuredContent: { pass: v.pass, pageCount: v.pageCount, reused: v.reused, cacheEligible: v.cacheEligible, errors: v.errors.slice(0,5), logPath: v.logPath, lintClean: v.lint ? v.lint.clean : null } };
       }
 
       case 'edit_file': {
+        const config = await loadConfig();
         const { client } = await getClient(args.projectName);
-        const res = await client.editFile(args.filePath, args.oldString, args.newString, args.replaceAll || false, args.commitMessage);
-        const tail = res.pushed
-          ? `Edited ${args.filePath}${res.merged ? ' (auto-merged a concurrent Overleaf change)' : ''}. NEXT: finish the coherent edit batch, then verify_build once on the entrypoint.`
-          : `No change applied to ${args.filePath} (${res.reason}).`;
+        const res = await client.editFile(args.filePath, args.oldString, args.newString, args.replaceAll || false, args.commitMessage, { push: resolvePush(config.settings, args) });
+        const tail = res.reason
+          ? `No change applied to ${args.filePath} (${res.reason}).`
+          : mutationTail(res, `Edited ${args.filePath}`);
         return { content: [{ type: 'text', text: tail }] };
       }
 
       case 'write_file': {
+        const config = await loadConfig();
         const { client } = await getClient(args.projectName);
         const res = await client.writeFile(args.filePath, args.content, {
           baseSha: args.baseSha,
           overwrite: args.overwrite,
           commitMessage: args.commitMessage,
+          push: resolvePush(config.settings, args),
         });
-        const tail = res.pushed
-          ? `Wrote ${args.filePath}. NEXT: finish the coherent edit batch, then verify_build once on the entrypoint.`
-          : `No change detected for ${args.filePath} (${res.reason}).`;
+        const tail = res.reason
+          ? `No change detected for ${args.filePath} (${res.reason}).`
+          : mutationTail(res, `Wrote ${args.filePath}`);
         return { content: [{ type: 'text', text: tail }] };
       }
 
       case 'upload_file': {
+        const config = await loadConfig();
         const { client } = await getClient(args.projectName);
         const res = await client.uploadFile({
+          push: resolvePush(config.settings, args),
           srcPath: args.srcPath,
           destPath: args.destPath,
           files: args.files,
@@ -1703,9 +1817,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeTool(r
           overwrite: args.overwrite,
           commitMessage: args.commitMessage,
         });
-        const tail = res.pushed
-          ? `Uploaded ${res.files.length} file(s): ${res.files.join(', ')}. NEXT: reference each figure with \\includegraphics{...} via edit_file, then compile_file.`
-          : `No upload performed (${res.reason}).`;
+        const tail = res.reason
+          ? `No upload performed (${res.reason}).`
+          : `${mutationTail(res, `Uploaded ${res.files.length} file(s): ${res.files.join(', ')}`)} Reference each figure with \\includegraphics{...} via edit_file.`;
         return { content: [{ type: 'text', text: tail }] };
       }
 
@@ -1718,9 +1832,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeTool(r
       }
 
       case 'add_citation': {
+        const config = await loadConfig();
         const { client } = await getClient(args.projectName);
-        const res = await client.addCitation({ entry: args.entry, commitMessage: args.commitMessage });
-        return { content: [{ type: 'text', text: res.pushed ? `Added citation "${res.key}" to refs.bib and pushed.` : `No change for "${res.key}" (${res.reason}).` }] };
+        const res = await client.addCitation({ entry: args.entry, commitMessage: args.commitMessage, push: resolvePush(config.settings, args) });
+        return { content: [{ type: 'text', text: res.reason ? `No change for "${res.key}" (${res.reason}).` : mutationTail(res, `Added citation "${res.key}" to refs.bib`) }] };
       }
 
       case 'cite_lint': {
@@ -1739,22 +1854,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeTool(r
       }
 
       case 'restore': {
+        const config = await loadConfig();
         const { client } = await getClient(args.projectName);
-        const r = await client.restore(args.label);
-        return { content: [{ type: 'text', text: `Restored "${r.label}" and pushed (forward commit). Run compile_file/verify_build to confirm.` }] };
+        const r = await client.restore(args.label, { push: resolvePush(config.settings, args) });
+        return { content: [{ type: 'text', text: `${mutationTail(r, `Restored "${r.label}" as a forward commit`)} Run verify_build to confirm.` }] };
       }
 
       case 'voice_lint': {
         const config = await loadConfig();
         const { client } = await getClient(args.projectName);
-        // settings.voiceLinter / $OVERLEAF_VOICE_LINTER override the bundled
-        // example linter, which ships with the package so voice_lint works out
-        // of the box. The example implements generic prose checks; point the
-        // setting at your own command to enforce a house style.
-        const command = config.settings?.voiceLinter
-          || process.env.OVERLEAF_VOICE_LINTER
-          || `node ${path.join(PACKAGE_DIR, 'examples', 'voice-lint.mjs')}`;
-        const r = await client.voiceLint(args.filePath, { command });
+        const r = await client.voiceLint(args.filePath, { command: voiceLinterCommand(config) });
         return { content: [{ type: 'text', text: r.clean ? `✓ voice OK — ${args.filePath}${r.findings ? `\n${r.findings}` : ''}` : `voice findings in ${args.filePath}:\n${r.findings}` }] };
       }
 

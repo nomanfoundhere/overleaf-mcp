@@ -68,7 +68,7 @@ test('external recorder dependency edits invalidate reuse',async t=>{
  assert.equal((await c.verifyBuild('main.tex','pdflatex')).reused,true);
  await writeFile(input,'Version two');assert.equal((await c.verifyBuild('main.tex','pdflatex')).reused,false);
 });
-test('explicit sync does not reset when fast-forward pull fails',async t=>{
- const {c}=await fixture(t);const calls=[];c._git=async args=>{calls.push(args);throw Error('conflict');};
- await assert.rejects(c.syncProject(),/conflict/);assert.equal(calls.length,1);assert.ok(calls[0].includes('--ff-only'));assert.ok(!calls[0].includes('reset'));
+test('explicit sync does not reset when the fetch fails',async t=>{
+ const {c}=await fixture(t);const calls=[];c._git=async args=>{calls.push(args);if(args.includes('fetch'))throw Error('network down');return {stdout:''};};
+ await assert.rejects(c.syncProject(),/network down/);assert.ok(calls.some(a=>a.includes('fetch')));assert.ok(calls.every(a=>!a.includes('reset')));
 });

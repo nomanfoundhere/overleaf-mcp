@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/overleaf-forge.svg)](https://www.npmjs.com/package/overleaf-forge) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license) ![Node](https://img.shields.io/badge/node-%E2%89%A518-43853d.svg)
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant (Claude Code, Claude Desktop, or any MCP client) read, edit, compile, and verify an [Overleaf](https://www.overleaf.com) project over Overleaf's built-in **git** integration. The model edits a local clone with surgical, conflict-safe operations and pushes to Overleaf; nothing depends on scraping the web UI.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant (Claude Code, Claude Desktop, or any MCP client) read, edit, compile, and verify an [Overleaf](https://www.overleaf.com) project over Overleaf's built-in **git** integration. The model edits a local clone with surgical, conflict-safe operations and publishes verified batches to Overleaf; nothing depends on scraping the web UI.
 
 > **Acknowledgement.** Forked from [mjyoo2/OverleafMCP](https://github.com/mjyoo2/OverleafMCP), the original Overleaf MCP server. This fork adds conflict-safe editing, binary/figure upload, a clean-build PASS/FAIL gate, citation and voice linting, snapshots, a bootstrap for recurring structured documents, per-project contexts, and a hardened git layer (no-shell `execFile`, credential-helper auth, error redaction).
 
@@ -49,7 +49,7 @@ For an iterative edit, build, and review loop on a large document the tool traff
 
 - Node.js ≥ 18 (ESM).
 - `git` on `PATH`.
-- A LaTeX distribution with `latexmk` (only for `compile_file` / `verify_build`; the rest works without it). The default engine is LuaLaTeX; `latexmk` is expected at `/Library/TeX/texbin` (MacTeX) or otherwise on `PATH`.
+- A LaTeX distribution with `latexmk` (only for `verify_build`; the rest works without it). The default engine is LuaLaTeX; `latexmk` is expected at `/Library/TeX/texbin` (MacTeX) or otherwise on `PATH`.
 - An Overleaf account with **Git integration** enabled (a paid feature at time of writing).
 
 ## Install
@@ -224,15 +224,17 @@ A typical editing session, in the model's words:
 4. *"Add a figure: upload `~/plots/fig1.png` to `figures/fig1.png`."* → `upload_file`
 5. *"Verify the build."* → `verify_build` → `✓ PASS — 12 pages`
 
-Every write commits and pushes to Overleaf; `verify_build` is the gate before calling the work done.
+Every write commits locally; `verify_build` is the gate before calling the work done, and `publish_changes` pushes the verified commits to Overleaf in one step. Set `settings.autoPush: true` (or pass `push: true`) to push on every write instead.
 
 ## Conflict safety
 
 Edits never silently overwrite a concurrent Overleaf change.
 
-- **`edit_file`** pulls the latest first (so a non-overlapping browser edit is absorbed), then replaces an exact anchor string. If the anchor is gone, the region changed since you read it, and the edit refuses rather than guessing. On the rare push race, git performs a real 3-way merge and the edit refuses only on a true overlap.
-- **`write_file`** (full-file create or overwrite) creates a new file freely. To overwrite an existing file it requires either the `baseSha` you got from `read_file` (a stale one is refused) or an explicit `overwrite: true`. It never merges a wholesale replacement; a push race refuses and resets.
+- **Local by default.** Write tools commit to the local clone and stay off the network unless `push: true` or `settings.autoPush` is set. `publish_changes` pushes the accumulated commits after verification. When any push is refused, only that operation's own commit is rolled back; earlier unpublished commits are never discarded.
+- **`edit_file`** replaces an exact anchor string. If the anchor is gone, the region changed since you read it, and the edit refuses rather than guessing. When pushing, it pulls first (so a non-overlapping browser edit is absorbed), and on the rare push race git performs a real 3-way merge and the edit refuses only on a true overlap.
+- **`write_file`** (full-file create or overwrite) creates a new file freely. To overwrite an existing file it requires either the `baseSha` you got from `read_file` (a stale one is refused) or an explicit `overwrite: true`. It never merges a wholesale replacement; a push race refuses and rolls back its own commit.
 - **`upload_file`** uses the same gate for binaries, never merges, and confines every destination path inside the project clone.
+- **`sync_project`** fetches and fast-forwards when the clone is only behind. On divergence it changes nothing and reports the local and remote commits; `strategy: "rebase"` replays local work onto Overleaf (aborting cleanly on conflict), and `strategy: "reset"` discards local work only with `confirm` equal to the reported head, after tagging `mcp-backup/*` copies of the old head and any uncommitted edits.
 - An explicit `projectName` that doesn't resolve is an **error**, never a silent fall-through to a different project, so a write cannot land in the wrong repo.
 
 ## Bootstrap for recurring structured documents
@@ -267,7 +269,7 @@ By the built-in convention this parses the name, locates the parent course folde
 | `read_file` | Read a file. The first line carries the file's `baseSha` (its git blob hash) for conflict-safe writes. |
 | `list_files` | List files in the project, filtered by extension. |
 | `get_sections` | List `\section` / `\subsection` / `\subsubsection` entries in a `.tex`. |
-| `get_section_content` | Pull a single section's body by title (level-aware: a section keeps its subsections). |
+| `get_section_content` | One section's body by exact, unique title, `\section` down to `\paragraph` (level-aware: a section keeps its subsections). `bundle: true` adds the referenced equation/figure blocks, bibliography entries and assets. |
 | `search_text` | Grep tracked files. Regex by default; `fixed` for a literal, `ignoreCase`, `extension` to scope. Returns `file:line:match`. |
 | `status_summary` | File count, main file, section count. |
 
@@ -275,7 +277,7 @@ By the built-in convention this parses the name, locates the parent course folde
 
 | Tool | Purpose |
 | --- | --- |
-| `edit_file` | Anchored `oldString` → `newString` edit + commit + push. Conflict-safe; auto-merges non-overlapping concurrent edits. Preferred for existing files. |
+| `edit_file` | Anchored `oldString` → `newString` edit + commit (push per `push` / `settings.autoPush`). Conflict-safe; auto-merges non-overlapping concurrent edits. Preferred for existing files. |
 | `write_file` | Create a new file, or overwrite one wholesale. Existing-file overwrite needs `baseSha` or `overwrite: true`. |
 | `upload_file` | Upload binary file(s) (figures) from a local path. Single or batch (one commit). Byte-exact, path-confined, same conflict gate. |
 
@@ -283,18 +285,19 @@ By the built-in convention this parses the name, locates the parent course folde
 
 | Tool | Purpose |
 | --- | --- |
-| `compile_file` | Compile with `latexmk` from the repo root, so the project `.latexmkrc`, reruns, and bibliography all apply; reports errors, undefined refs, overfull boxes. |
-| `verify_build` | Clean-from-scratch compile + PASS/FAIL verdict: PASS only with a PDF and zero errors / undefined references / undefined citations. Reports page count. The done-bar gate. |
+| `verify_build` | Compile with `latexmk` from the repo root (project `.latexmkrc`, reruns and bibliography apply) + PASS/FAIL verdict: PASS only with a PDF and zero errors / undefined references / undefined citations. Reports page count. Default is the clean from-scratch done-bar gate; `clean: false` is a quick incremental rebuild; `lint` adds voice-linter findings to the gate. |
+| `sync_project` | Fetch and reconcile with Overleaf: fast-forward, report divergence, or resolve it with `rebase` / confirmed `reset` (see Conflict safety). |
+| `publish_changes` | Verify the clean local HEAD and push every unpublished commit once. |
 
 **Citations, snapshots, voice**
 
 | Tool | Purpose |
 | --- | --- |
-| `add_citation` | Append a BibTeX entry to `refs.bib` (refuses a duplicate key) + push. |
+| `add_citation` | Append a BibTeX entry to `refs.bib` (refuses a duplicate key) + commit. |
 | `cite_lint` | Report undefined (`\cite` with no entry) and unused (entry never cited) citations. Read-only. |
 | `checkpoint` | Mark a local rollback point (a `mcp-snap/<label>` tag) before a risky edit. |
-| `restore` | Roll back to a checkpoint via a forward commit + push (no force, no history rewrite). |
-| `voice_lint` | Run a prose linter on a `.tex` (the bundled `examples/voice-lint.mjs` by default; override via `settings.voiceLinter`). Lints the local working copy as-is, never pulls. Read-only, advisory. |
+| `restore` | Roll back to a checkpoint via a forward commit (no force, no history rewrite). |
+| `voice_lint` | Run a prose linter on a `.tex` (the bundled `examples/voice-lint.mjs` by default; override via `settings.voiceLinter`). Lints the local working copy as-is, never pulls. Read-only and advisory; `verify_build` with `lint` makes it gating. |
 
 ## How it works
 
@@ -328,13 +331,13 @@ MIT. See [LICENSE](LICENSE) if present, or treat this as MIT per the upstream pr
 ## Efficient local reading and builds
 
 - `get_context({projectName, previousVersion})` returns a context version and omits unchanged content. The version covers project identity and the rendered guidance/context.
-- `get_section_bundle({projectName, filePath, sectionTitle, maxChars})` reads locally without pulling and returns directly referenced equation/figure blocks, matching BibTeX entries and asset paths. It reports missing matches and truncation. Macro-generated references, recursive TeX expansion and parenthesized BibTeX entries require a focused follow-up read.
-- All read, search, lint, dependency, render and build tools are local-only. Use `sync_project` explicitly before reading when needed. Existing clone synchronization uses fast-forward-only pull and refuses conflicts without resetting local work.
+- `get_section_content({projectName, filePath, sectionTitle, bundle: true, maxChars})` reads locally without pulling and returns directly referenced equation/figure blocks, matching BibTeX entries and asset paths. It reports missing matches and truncation. Macro-generated references, recursive TeX expansion and parenthesized BibTeX entries require a focused follow-up read.
+- All read, search, lint, dependency, render and build tools are local-only. Use `sync_project` explicitly before reading when needed. It fast-forwards only; divergence is reported, never auto-resolved.
 - Build output is compact by default. `verbose: true` includes a bounded log tail; the full log remains at the returned path.
 - `verify_build` can reuse a successful verification within the running server when project files, recorder inputs, tool binaries, environment and output artifacts are unchanged. `force: true` rebuilds. Missing recorder data, symlinks or executable build configuration conservatively disable reuse. The cache is in-memory and disappears on server restart. Custom build commands can have undeclared external dependencies, so projects with latexmkrc files or detected shell/Lua generation rebuild.
 - `controlled: true` runs `latexmk -norc -no-shell-escape` and permits caching in projects with a `.latexmkrc`, because the rc file cannot run. The mode still rejects shell escape, `minted` and Lua file generation. Add required absolute regular `externalInputs` so their content enters the cache key.
 - `dependency_index` records static TeX includes, figures, labels, references, citations and declared values. `change_report` compares a later index to a retained baseline and names affected sections. Dynamic macros are reported as unresolved rather than guessed.
 - `render_pages` caches a requested PDF page by PDF content hash, page, DPI and renderer version. `usage_stats` exposes aggregate in-process timing, response-size and cache-hit measurements without retaining request or document text.
-- `apply_changes` verifies an SHA-guarded UTF-8 multi-file candidate in an isolated worktree and fast-forwards one local commit only if verification passes. `publish_changes` separately re-verifies its exact clean revision, then pushes it once. Neither operation pulls, resets, retries or silently merges.
+- `apply_changes` verifies an SHA-guarded UTF-8 multi-file candidate in an isolated worktree and fast-forwards one local commit only if verification passes. `publish_changes` separately re-verifies its exact clean revision, then pushes it once, carrying every unpublished local commit. Neither operation pulls, resets, retries or silently merges.
 
 After updating the server, reconnect the MCP client so it reloads the process and tool schemas. Package publication is separate from installing these local changes.

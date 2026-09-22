@@ -58,6 +58,7 @@ test('checkpoint + restore rolls back content via a forward push', async () => {
   const r = await makeRemote({ 'main.tex': 'v1\n' });
   after(() => r.cleanup());
   const c = client(r);
+  await c.cloneOrPull(); // checkpoint is local-only: it tags an existing clone, never clones
   const cp = await c.checkpoint('p');
   assert.equal(cp.label, 'mcp-snap/p');
   await c.editFile('main.tex', 'v1', 'v2');
@@ -73,6 +74,7 @@ test('checkpoint refuses a duplicate label', async () => {
   const r = await makeRemote({ 'main.tex': 'x\n' });
   after(() => r.cleanup());
   const c = client(r);
+  await c.cloneOrPull();
   await c.checkpoint('dup');
   await assert.rejects(() => c.checkpoint('dup'), /already exists/i);
 });

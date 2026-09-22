@@ -48,7 +48,7 @@ test('_pushWithMerge auto-merges a non-overlapping divergence', async () => {
   after(() => r.cleanup());
   const c = await localClient(r);
   await diverge(r, c, { localFile: 'a.tex', localBody: 'A-local\n', remoteFile: 'b.tex', remoteBody: 'B-remote\n' });
-  await c._pushWithMerge();
+  await c._pushWithMerge((await git(c.repoPath, ['rev-parse', 'HEAD~1'])).stdout.trim());
   await c.cloneOrPull();
   assert.equal((await c.readFile('a.tex')), 'A-local\n');   // both survive
   assert.equal((await c.readFile('b.tex')), 'B-remote\n');
@@ -59,9 +59,11 @@ test('_pushWithMerge refuses + resets clean on an overlapping divergence', async
   after(() => r.cleanup());
   const c = await localClient(r);
   await diverge(r, c, { localFile: 'a.tex', localBody: 'local\n', remoteFile: 'a.tex', remoteBody: 'remote\n' });
-  await assert.rejects(() => c._pushWithMerge(), /conflict/i);
+  const preHead = (await git(c.repoPath, ['rev-parse', 'HEAD~1'])).stdout.trim();
+  await assert.rejects(() => c._pushWithMerge(preHead), /conflict/i);
   const { stdout } = await git(c.repoPath, ['status', '--porcelain']);
   assert.equal(stdout.trim(), '');              // clean, no merge leftovers
+  assert.equal((await git(c.repoPath, ['rev-parse', 'HEAD'])).stdout.trim(), preHead); // rolled back to pre-op, not origin
 });
 
 test('editFile replaces a unique anchor and pushes', async () => {
