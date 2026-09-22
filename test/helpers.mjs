@@ -62,3 +62,14 @@ export async function assertClean(repoPath) {
   const { stdout: remote } = await git(repoPath, ['rev-parse', '@{u}']);
   if (local.trim() !== remote.trim()) throw new Error('HEAD != upstream');
 }
+
+// latexmk executes the user's own rc files, which the build cache treats as
+// executable configuration. Point HOME at an empty directory so cache tests
+// exercise the cache logic, not whatever rc files this machine happens to have.
+export async function isolateLatexmkRc() {
+  const home = await mkdtemp(path.join(tmpdir(), 'omcp-home-'));
+  process.env.HOME = home;
+  delete process.env.XDG_CONFIG_HOME;
+  delete process.env.LATEXMKRCSYS;
+  return home;
+}

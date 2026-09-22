@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 export function versionedContext(key, text, previousVersion) {
@@ -21,6 +22,16 @@ export function controlledBuildOptions(options = {}) {
     throw new TypeError('externalInputs must contain absolute paths');
   }
   return { sourcesOnly: options.sourcesOnly === true, controlled, externalInputs: [...new Set(externalInputs)] };
+}
+
+// The rc files latexmk reads besides the project's own (latexmk(1), CONFIGURATION FILES).
+export function latexmkUserRcFiles(env = process.env, home = os.homedir()) {
+  const xdg = env.XDG_CONFIG_HOME || path.join(home, '.config');
+  return [
+    env.LATEXMKRCSYS,
+    path.join(xdg, 'latexmk', 'latexmkrc'),
+    path.join(home, '.latexmkrc'),
+  ].filter(Boolean);
 }
 
 export async function buildFingerprint(root, entry, engine, options = {}) {
@@ -45,6 +56,18 @@ export async function buildFingerprint(root, entry, engine, options = {}) {
     }
   };
   await visit(root);
+  // latexmk also executes user and system rc files outside the project. They
+  // are arbitrary Perl like a project .latexmkrc, so they get the same rule:
+  // their content enters the key, and outside controlled mode (-norc) their
+  // presence makes the full cache ineligible.
+  if (!controlled) {
+    for (const rc of latexmkUserRcFiles()) {
+      const bytes = await readFile(rc).catch(() => null);
+      if (bytes === null) continue;
+      records.push([rc, hash(bytes)]);
+      unsafe = true;
+    }
+  }
   for (const input of externalInputs) {
     const stat = await lstat(input).catch(() => null);
     if (!stat || !stat.isFile() || stat.isSymbolicLink()) throw new Error(`external input must be a regular non-symlink file: ${input}`);

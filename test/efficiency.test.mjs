@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, mkdir, rm, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { versionedContext, sectionBundle } from '../efficiency.js';
+import { versionedContext, sectionBundle, buildFingerprint, latexmkUserRcFiles } from '../efficiency.js';
 import { OverleafGitClient } from '../overleaf-mcp-server.js';
+import { isolateLatexmkRc } from './helpers.mjs';
+
+await isolateLatexmkRc();
 
 const doc='\\documentclass{article}\\begin{document}Hello\\end{document}\n';
 async function fixture(t) {
@@ -71,4 +74,34 @@ test('external recorder dependency edits invalidate reuse',async t=>{
 test('explicit sync does not reset when the fetch fails',async t=>{
  const {c}=await fixture(t);const calls=[];c._git=async args=>{calls.push(args);if(args.includes('fetch'))throw Error('network down');return {stdout:''};};
  await assert.rejects(c.syncProject(),/network down/);assert.ok(calls.some(a=>a.includes('fetch')));assert.ok(calls.every(a=>!a.includes('reset')));
+});
+
+test('publish reuse: a recent PASS on identical sources is reused even when the full cache is ineligible',async t=>{
+ const {root,c}=await fixture(t);await writeFile(path.join(root,'.latexmkrc'),'# executable config: full cache ineligible\n');
+ const gate=await c.verifyBuild('main.tex','pdflatex');assert.equal(gate.pass,true);assert.equal(gate.cacheEligible,false);
+ assert.equal((await c.verifyBuild('main.tex','pdflatex')).reused,false);                 // plain verify never reuses here
+ assert.equal((await c.verifyBuild('main.tex','pdflatex',{reuseRecentPass:true})).reused,true);
+ assert.equal((await c.verifyBuild('main.tex','pdflatex',{reuseRecentPass:true,force:true})).reused,false);
+ await writeFile(path.join(root,'extra.txt'),'an untracked change');                        // any byte change invalidates
+ assert.equal((await c.verifyBuild('main.tex','pdflatex',{reuseRecentPass:true})).reused,false);
+});
+test('publish reuse: a failed build clears the recent PASS',async t=>{
+ const {root,c}=await fixture(t);await writeFile(path.join(root,'.latexmkrc'),'# rc\n');
+ assert.equal((await c.verifyBuild('main.tex','pdflatex')).pass,true);
+ await writeFile(path.join(root,'main.tex'),'\\documentclass{article}\\begin{document}\\ref{nope}\\end{document}\n');
+ assert.equal((await c.verifyBuild('main.tex','pdflatex')).pass,false);
+ await writeFile(path.join(root,'main.tex'),doc);                                            // same bytes as the old PASS
+ assert.equal((await c.verifyBuild('main.tex','pdflatex',{reuseRecentPass:true})).reused,false);
+});
+test('user latexmkrc makes non-controlled builds ineligible and enters the sources key',async t=>{
+ const {root}=await fixture(t);const home=process.env.HOME;const rc=path.join(home,'.latexmkrc');
+ t.after(()=>rm(rc,{force:true}));
+ assert.deepEqual(latexmkUserRcFiles({},'/h'),[path.join('/h','.config','latexmk','latexmkrc'),path.join('/h','.latexmkrc')]);
+ const before=await buildFingerprint(root,'main.tex','pdflatex',{sourcesOnly:true});
+ await writeFile(rc,'$biber = "x";\n');
+ const withRc=await buildFingerprint(root,'main.tex','pdflatex',{sourcesOnly:true});
+ assert.notEqual(before,withRc);
+ await writeFile(path.join(root,'main.fls'),`INPUT ${path.join(root,'main.tex')}\n`);
+ assert.equal(await buildFingerprint(root,'main.tex','pdflatex'),null);                     // ineligible
+ assert.notEqual(await buildFingerprint(root,'main.tex','pdflatex',{controlled:true}),null); // -norc ignores it
 });

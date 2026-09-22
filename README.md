@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/overleaf-forge.svg)](https://www.npmjs.com/package/overleaf-forge) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license) ![Node](https://img.shields.io/badge/node-%E2%89%A518-43853d.svg)
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant (Claude Code, Claude Desktop, or any MCP client) read, edit, compile, and verify an [Overleaf](https://www.overleaf.com) project over Overleaf's built-in **git** integration. The model edits a local clone with surgical, conflict-safe operations and publishes verified batches to Overleaf; nothing depends on scraping the web UI.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant (Claude Code, Claude Desktop, or any MCP client) read, edit, compile, and verify an [Overleaf](https://www.overleaf.com) project over Overleaf's built-in **git** integration. The model edits a local clone with surgical, conflict-safe operations and publishes verified batches to Overleaf. Nothing depends on scraping the web UI.
 
 > **Acknowledgement.** Forked from [mjyoo2/OverleafMCP](https://github.com/mjyoo2/OverleafMCP), the original Overleaf MCP server. This fork adds conflict-safe editing, binary/figure upload, a clean-build PASS/FAIL gate, citation and voice linting, snapshots, a bootstrap for recurring structured documents, per-project contexts, and a hardened git layer (no-shell `execFile`, credential-helper auth, error redaction).
 
@@ -12,38 +12,49 @@ Editing a LaTeX project through an AI normally means one of two bad options: pas
 
 ## Token economy
 
-Safety is one motivation; keeping a large document out of the model's context window is the other, and it drove most of the tool design. A 50 KB chapter is about 12K to 13K tokens, so the cost of a naive workflow is dominated by moving that whole file in and out.
+Safety is one motivation. Keeping a large document out of the model's context window is the other, and it drove most of the tool design. A 50 KB chapter is about 12K to 13K tokens, so the cost of a naive workflow is dominated by moving that whole file in and out.
 
-Rough token cost per operation on such a chapter, and the cut each tool buys:
+Measured token cost on a real 48 KB chapter (a 30-page report with a bibliography and `minted` listings). The whole-file column is an estimate of the read-and-rewrite alternative. The overleaf-forge column is measured over MCP, at about four characters per token.
 
-| Operation (on a ~50 KB chapter) | Whole-file workflow | overleaf-forge | Reduction |
+| Operation (on a ~50 KB chapter) | Whole-file workflow (estimate) | overleaf-forge (measured) | Reduction |
 | --- | --- | --- | --- |
-| One surgical edit | ~25K (read + write the file) | ~0.15K (`edit_file`) | ~99% |
-| A dozen edits (one revision pass) | ~170K | ~3K | ~98% |
-| One compile check | ~1.5K (raw `latexmk` log) | ~0.02K (`verify_build` verdict) | ~99% |
+| One surgical edit | ~25K (read + write the file) | ~25 tokens (`edit_file`) | >99% |
+| A dozen edits (one revision pass) | ~170K | ~0.3K | >99% |
+| One passing build check | ~1.5K to 2K (raw `latexmk` log) | ~4 tokens (`verify_build` PASS) | >99% |
 | Locating a passage | ~13K (read the whole file) | ~2K (`get_section_content` / `search_text`) | ~85% |
+| Re-reading unchanged guidance | full guidance again | ~25 tokens (`get_context` with `previousVersion`) | >99% |
 
-Figures are order-of-magnitude, for a chapter this size; the absolute numbers scale with file size, the percentages roughly hold.
+The absolute numbers scale with file size. The percentages roughly hold.
 
-- **Anchored edits instead of whole-file rewrites.** Changing one phrase by reading the whole file and writing it back costs roughly 25K tokens per edit: the file into context, then the file back out as the write payload. `edit_file` sends only the old and new strings and returns a one-line confirmation, on the order of 100 tokens. Across a dozen edits to a single chapter that is the difference between roughly 170K tokens and 3K.
-- **A one-line build verdict instead of a raw log.** `verify_build` returns a one-line verdict (`PASS: 24 pages; 0 errors; 0 undefined references; ...`) rather than the `latexmk` output. A raw log runs to hundreds or thousands of tokens per compile, and a multi-pass log buries the true final state under transient undefined-reference warnings from early passes (the exact trap `verify_build` classifies away by reading the final log). Over a session of repeated compiles that is a few thousand tokens against a few dozen.
-- **Section and grep reads instead of the whole file.** `get_section_content` returns one section and `search_text` returns the matching lines, so locating something costs 1K to 3K tokens rather than the full 13K.
+- **Anchored edits instead of whole-file rewrites.** Changing one phrase by reading the whole file and writing it back costs roughly 25K tokens per edit: the file enters the context, then leaves it again as the write payload. `edit_file` sends only the old and new strings and returns one line naming the new local commit.
+- **A verdict instead of a log.** A passing `verify_build` returns `PASS: 30 pages.` A failing one returns the counts, the first offending lines and the log path. A raw multi-pass log costs hundreds to thousands of tokens and buries the true final state under transient undefined-reference warnings from early passes, which `verify_build` avoids by classifying the final log only.
+- **Section and grep reads instead of the whole file.** `get_section_content` returns one section and `search_text` returns the matching lines, so locating something costs 1K to 3K tokens rather than 13K.
+- **Fewer network round trips.** Reads, builds and edits work on the local clone. In the measured session below, the previous release made 29 git network operations and this one makes 1, the final push.
 
-For an iterative edit, build, and review loop on a large document the tool traffic runs about an order of magnitude lighter than a read-and-rewrite-the-whole-file approach. The gain is workflow-dependent: a single full-file rewrite is a wash, since `write_file` moves the same bytes either way. It is the repeated, surgical work that compounds, which is exactly the shape of writing and revising a paper.
+**A measured session.** Context read, section read, twelve anchored edits, an intermediate build, the final gate, a context re-read and a publish, on the chapter above:
+
+| | 2.9.1 | 2.12 |
+| --- | --- | --- |
+| Tool responses | ~13.9K tokens | ~5.5K tokens |
+| Tool definitions (paid once per session) | ~3.9K tokens | ~5.0K tokens |
+| Git network operations | 29 | 1 |
+| Wall time against a local stand-in remote | 53 s | 53 s |
+
+The remaining wall time is LaTeX. Against real Overleaf, every one of the 28 avoided network operations is an HTTPS round trip. Most of the saving in tool responses comes from the guidance: a shorter default guide, and a compact reply when it is re-read unchanged. A revision session that also loads a long personal style reference narrows the gap.
 
 ## Features
 
-- **Local-first, publish when verified**: edits commit to the local clone and stay off the network; `publish_changes` verifies the build once and pushes the whole batch. `settings.autoPush` restores push-on-every-write.
-- **Surgical, conflict-safe edits**: `edit_file` replaces an exact anchor and refuses if the region changed; when pushing, non-overlapping concurrent edits auto-merge via git.
+- **Local-first, publish when verified**: edits commit to the local clone and stay off the network until `publish_changes` verifies the build and pushes the whole batch. `settings.autoPush` restores push-on-every-write.
+- **Surgical, conflict-safe edits**: `edit_file` replaces an exact anchor and refuses if the region changed. When pushing, non-overlapping concurrent edits auto-merge via git.
 - **No silent clobbering**: full-file `write_file` requires a freshness token (`baseSha`) or an explicit `overwrite` to replace an existing file.
 - **Divergence recovery**: `sync_project` reports what differs between the clone and Overleaf without changing anything, then resolves it by rebase (aborts cleanly on conflict) or by a confirmed reset that tags a backup first.
 - **Binary / figure upload**: add PNG/PDF figures from disk (single or a whole set in one commit), byte-exact, path-confined to the project.
-- **Build verification**: `verify_build` compiles from scratch with `latexmk` and returns PASS/FAIL on the real "done" bar (a PDF, zero errors, zero undefined references/citations) with the page count. Unchanged successful builds are reused; `clean: false` gives a quick intermediate rebuild; `lint` makes voice-linter findings fail the gate.
-- **Citation tooling**: append BibTeX entries with duplicate-key protection; lint for undefined and unused citations.
+- **Build verification**: `verify_build` compiles from scratch with `latexmk` and returns PASS/FAIL on the real "done" bar (a PDF, zero errors, zero undefined references/citations) with the page count. An unchanged successful build is reused instead of rebuilt. `clean: false` gives a quicker incremental rebuild for intermediate checks, and `lint` makes voice-linter findings fail the gate.
+- **Citation tooling**: append BibTeX entries with duplicate-key protection, and lint for undefined and unused citations.
 - **Section-aware reading**: list sections and pull a single section's body by title, optionally bundled with the equations, figures and bibliography entries it references.
 - **Dependency tracking**: `dependency_index` and `change_report` name the sections affected by a changed label, value, citation or included file.
 - **Project grep**: `search_text` over tracked files.
-- **Snapshots**: `checkpoint` a rollback point before a risky edit; `restore` it as a forward commit (no force-push, no history rewrite).
+- **Snapshots**: `checkpoint` a rollback point before a risky edit, then `restore` it as a forward commit (no force-push, no history rewrite).
 - **Recurring-document bootstrap**: one call to clone, register, and scaffold a new instance of a structured document (see [Bootstrap](#bootstrap-for-recurring-structured-documents)).
 - **Per-project context**: durable notes and writing guidelines surfaced to the model at the start of a session.
 - **Hardened git layer**: every subprocess runs through `execFile` (no shell), the token is supplied via an environment-backed credential helper and never appears in a command or an error, and tokenized URLs are redacted from any error returned.
@@ -52,7 +63,7 @@ For an iterative edit, build, and review loop on a large document the tool traff
 
 - Node.js ≥ 18 (ESM).
 - `git` on `PATH`.
-- A LaTeX distribution with `latexmk` (only for `verify_build`; the rest works without it). The default engine is LuaLaTeX; `latexmk` is expected at `/Library/TeX/texbin` (MacTeX) or otherwise on `PATH`.
+- A LaTeX distribution with `latexmk` (only for `verify_build`; the rest works without it). The default engine is LuaLaTeX. `latexmk` is expected at `/Library/TeX/texbin` (MacTeX) or otherwise on `PATH`.
 - An Overleaf account with **Git integration** enabled (a paid feature at time of writing).
 
 ## Install
@@ -79,7 +90,7 @@ For an iterative edit, build, and review loop on a large document the tool traff
 
 3. Restart the client (or reload its MCP servers). That's it.
 
-`npx` fetches and runs the published package on demand. The token and project id are the entire setup for a single project, with no config file (this is **env-only mode**). `@latest` means each client restart picks up the newest published version automatically; pin `overleaf-forge@2.11.0` instead to freeze a version. For multiple projects, per-project contexts, or the SSA bootstrap, see [Configuration](#configuration).
+`npx` fetches and runs the published package on demand. The token and project id are the entire setup for a single project, with no config file (this is **env-only mode**). `@latest` means each client restart picks up the newest published version automatically. Pin `overleaf-forge@2.11.0` instead to freeze a version. For multiple projects, per-project contexts, or the SSA bootstrap, see [Configuration](#configuration).
 
 An MCP server is not an app you launch yourself: the client starts it as a subprocess, so "installing" it just means making its command available to the client. The `npx` form above needs no install step. If you would rather have a real command on your `PATH`, install it globally:
 
@@ -101,7 +112,7 @@ Then use `"command": "node", "args": ["/absolute/path/to/overleaf-mcp-server.js"
 
 ### Wiring into specific clients
 
-The `mcpServers` schema is identical across clients; only the file location differs. Put the `npx` block above inside each.
+The `mcpServers` schema is identical across clients: only the file location differs. Put the `npx` block above inside each.
 
 | Client | Config file |
 | --- | --- |
@@ -116,7 +127,7 @@ Restart the client (or reload its MCP servers) after editing, so it spawns the s
 
 **As a user.** With `overleaf-forge@latest` in your config (the recommended form), restart the client or reload its MCP servers and it fetches the newest published version. If you pinned a version (`overleaf-forge@2.11.0`), change the number. If `npx` seems to keep running an old version, clear its cache with `npx clear-npx-cache` and restart. If you installed globally instead, update with `npm update -g overleaf-forge`.
 
-**Upgrading to 2.11: edits no longer push by default.** `edit_file`, `write_file`, `upload_file`, `add_citation` and `restore` now commit to the local clone and report the unpublished count; nothing reaches Overleaf until `publish_changes` runs. To keep the old push-on-every-write behaviour, set `autoPush: true` through `configure` (or pass `push: true` per call). Since 2.10, reads and builds also stop pulling, so start a session with `sync_project` when Overleaf may have moved. `compile_file` is now `verify_build({clean: false})`, and `get_section_bundle` is now `get_section_content({bundle: true})`.
+**Upgrading from 2.9 or earlier: edits no longer push by default.** Since 2.11, `edit_file`, `write_file`, `upload_file`, `add_citation` and `restore` commit to the local clone and report the unpublished count: nothing reaches Overleaf until `publish_changes` runs. To keep the old push-on-every-write behaviour, set `autoPush: true` through `configure` (or pass `push: true` per call). Since 2.10, reads and builds no longer pull either, so start a session with `sync_project` when Overleaf may have moved. `compile_file` is now `verify_build({clean: false})`, and `get_section_bundle` is now `get_section_content({bundle: true})`.
 
 **As the maintainer (publishing a new release).** From the repository:
 
@@ -181,11 +192,11 @@ That creates `~/.overleaf-mcp/projects.json` from the example and copies the edi
 | `projects.<key>.cwd` | Directory you launch the client from for this project; used to auto-detect the active project. |
 | `projects.<key>.localPath` | Explicit clone location (optional). |
 
-`projects.json` is re-read on every call, so registering a project or rotating the token takes effect immediately, with no restart. (Code changes do need a restart; the server loads its `.js` once at startup.)
+`projects.json` is re-read on every call, so registering a project or rotating the token takes effect immediately, with no restart. (Code changes do need a restart: the server loads its `.js` once at startup.)
 
 ### Where files live
 
-User state (the `projects.json`, per-project `contexts/`, customised `templates/`, and the git clones) lives in the **data home**, resolved as: `$OVERLEAF_MCP_HOME` if set, else the package directory when it already holds a `projects.json` (so an existing local clone keeps working untouched), else `~/.overleaf-mcp`. Bundled, read-only defaults (the templates and the stock writing-guidelines) ship inside the package; a copy you place in the data home overrides the bundled one. For personal writing rules, use `writing-guidelines.local.md` (gitignored, read first on every `get_context` call); it stays distinct from the bundled file even when the data home is the package directory.
+User state (the `projects.json`, per-project `contexts/`, customised `templates/`, and the git clones) lives in the **data home**, resolved as: `$OVERLEAF_MCP_HOME` if set, else the package directory when it already holds a `projects.json` (so an existing local clone keeps working untouched), else `~/.overleaf-mcp`. Bundled, read-only defaults (the templates and the stock writing-guidelines) ship inside the package, and a copy you place in the data home overrides the bundled one. For personal writing rules, use `writing-guidelines.local.md` (gitignored, read first on every `get_context` call). It stays distinct from the bundled file even when the data home is the package directory.
 
 ### Getting Overleaf credentials
 
@@ -227,20 +238,20 @@ A typical editing session, in the model's words:
 2. *"Show me the sections in `Chapters/ch2.tex`."* → `get_sections`
 3. *"In `Chapters/ch2.tex`, change `\section{Intro}` to `\section{Introduction}`."* → `edit_file` (anchored, conflict-safe)
 4. *"Add a figure: upload `~/plots/fig1.png` to `figures/fig1.png`."* → `upload_file`
-5. *"Verify the build."* → `verify_build` → `PASS: 12 pages; 0 errors; ...`
+5. *"Verify the build."* → `verify_build` → `PASS: 12 pages.`
 6. *"Publish it."* → `publish_changes` (pushes every verified local commit to Overleaf at once)
 
-Every write commits locally; `verify_build` is the gate before calling the work done, and `publish_changes` pushes the verified commits to Overleaf in one step. Set `settings.autoPush: true` (or pass `push: true`) to push on every write instead.
+Every write commits locally. `verify_build` is the gate before calling the work done, and `publish_changes` pushes the verified commits to Overleaf in one step. Set `settings.autoPush: true` (or pass `push: true`) to push on every write instead.
 
 ## Conflict safety
 
 Edits never silently overwrite a concurrent Overleaf change.
 
-- **Local by default.** Write tools commit to the local clone and stay off the network unless `push: true` or `settings.autoPush` is set. `publish_changes` pushes the accumulated commits after verification. When any push is refused, only that operation's own commit is rolled back; earlier unpublished commits are never discarded.
+- **Local by default.** Write tools commit to the local clone and stay off the network unless `push: true` or `settings.autoPush` is set. `publish_changes` pushes the accumulated commits after verification. When any push is refused, only that operation's own commit is rolled back: earlier unpublished commits are never discarded.
 - **`edit_file`** replaces an exact anchor string. If the anchor is gone, the region changed since you read it, and the edit refuses rather than guessing. When pushing, it pulls first (so a non-overlapping browser edit is absorbed), and on the rare push race git performs a real 3-way merge and the edit refuses only on a true overlap.
-- **`write_file`** (full-file create or overwrite) creates a new file freely. To overwrite an existing file it requires either the `baseSha` you got from `read_file` (a stale one is refused) or an explicit `overwrite: true`. It never merges a wholesale replacement; a push race refuses and rolls back its own commit.
+- **`write_file`** (full-file create or overwrite) creates a new file freely. To overwrite an existing file it requires either the `baseSha` you got from `read_file` (a stale one is refused) or an explicit `overwrite: true`. It never merges a wholesale replacement: a push race refuses and rolls back its own commit.
 - **`upload_file`** uses the same gate for binaries, never merges, and confines every destination path inside the project clone.
-- **`sync_project`** fetches and fast-forwards when the clone is only behind. On divergence it changes nothing and reports the local and remote commits; `strategy: "rebase"` replays local work onto Overleaf (aborting cleanly on conflict), and `strategy: "reset"` discards local work only with `confirm` equal to the reported head, after tagging `mcp-backup/*` copies of the old head and any uncommitted edits.
+- **`sync_project`** fetches and fast-forwards when the clone is only behind. On divergence it changes nothing and reports the local and remote commits. `strategy: "rebase"` replays local work onto Overleaf (aborting cleanly on conflict), and `strategy: "reset"` discards local work only with `confirm` equal to the reported head, after tagging `mcp-backup/*` copies of the old head and any uncommitted edits.
 - An explicit `projectName` that doesn't resolve is an **error**, never a silent fall-through to a different project, so a write cannot land in the wrong repo.
 
 ## Bootstrap for recurring structured documents
@@ -251,7 +262,7 @@ Edits never silently overwrite a concurrent Overleaf change.
 
 By the built-in convention this parses the name, locates the parent course folder under `settings.academicRoot/Year <year>/Q*/<COURSE>*`, creates `<parent>/<ssaSubdir>/<name>/`, clones the Overleaf repo into an `overleaf/` subfolder, registers the project, and scaffolds a context file with a question template. Pass `cleanAfterClone: true` when the project was duplicated from a previous instance to wipe the body (chapters, appendices, bib, figures) while keeping the preamble.
 
-**Adapting it.** The parsing and folder rules are specific to the SSA scheme; to drive other recurring work, adjust `parseSsaName` / `findCourseFolder` and the `bootstrap_ssa` handler, or skip the bootstrap entirely and `register_project` each instance.
+**Adapting it.** The parsing and folder rules are specific to the SSA scheme. To drive other recurring work, adjust `parseSsaName` / `findCourseFolder` and the `bootstrap_ssa` handler, or skip the bootstrap entirely and `register_project` each instance.
 
 ## Tools
 
@@ -319,9 +330,9 @@ By the built-in convention this parses the name, locates the parent course folde
 
 - `get_context({projectName, previousVersion})` returns a context version and omits unchanged content. The version covers project identity and the rendered guidance/context.
 - `get_section_content({projectName, filePath, sectionTitle, bundle: true, maxChars})` reads locally without pulling and returns directly referenced equation/figure blocks, matching BibTeX entries and asset paths. It reports missing matches and truncation. Macro-generated references, recursive TeX expansion and parenthesized BibTeX entries require a focused follow-up read.
-- All read, search, lint, dependency, render and build tools are local-only. Use `sync_project` explicitly before reading when needed. It fast-forwards only; divergence is reported, never auto-resolved.
-- Build output is compact by default. `verbose: true` includes a bounded log tail; the full log remains at the returned path.
-- `verify_build` can reuse a successful verification within the running server when project files, recorder inputs, tool binaries, environment and output artifacts are unchanged. `force: true` rebuilds. Missing recorder data, symlinks or executable build configuration conservatively disable reuse. The cache is in-memory and disappears on server restart. Custom build commands can have undeclared external dependencies, so projects with latexmkrc files or detected shell/Lua generation rebuild.
+- All read, search, lint, dependency, render and build tools are local-only. Use `sync_project` explicitly before reading when needed. It fast-forwards on its own and resolves divergence only through an explicitly chosen strategy.
+- Build output is compact by default. `verbose: true` includes a bounded log tail, and the full log stays at the returned path.
+- `verify_build` can reuse a successful verification within the running server when project files, recorder inputs, tool binaries, environment and output artifacts are unchanged. `force: true` rebuilds. Missing recorder data, symlinks or executable build configuration (a project `.latexmkrc`, or the user's own `~/.latexmkrc`) conservatively disable reuse. The cache is in-memory and disappears on server restart. Custom build commands can have undeclared external dependencies, so projects with latexmkrc files or detected shell/Lua generation rebuild. `publish_changes` is the exception: it reuses a PASS from the same session when every project file is byte-identical since, so publishing does not repeat the final gate's full build.
 - `controlled: true` runs `latexmk -norc -no-shell-escape` and permits caching in projects with a `.latexmkrc`, because the rc file cannot run. The mode still rejects shell escape, `minted` and Lua file generation. Add required absolute regular `externalInputs` so their content enters the cache key.
 - `dependency_index` records static TeX includes, figures, labels, references, citations and declared values. `change_report` compares a later index to a retained baseline and names affected sections. Dynamic macros are reported as unresolved rather than guessed.
 - `render_pages` caches a requested PDF page by PDF content hash, page, DPI and renderer version. `usage_stats` exposes aggregate in-process timing, response-size and cache-hit measurements without retaining request or document text.
@@ -330,9 +341,13 @@ By the built-in convention this parses the name, locates the parent course folde
 
 After updating the server, reconnect the MCP client so it reloads the process and tool schemas.
 
+## Troubleshooting
+
+**Every build fails with undefined citations on macOS 27.** TeX Live 2025 ships biber as a universal binary that unpacks itself with `lipo -extract_family`, which the `lipo` in macOS 27 rejects (`biber: extracting arm64 binary with lipo failed`). A user-level workaround: a small `biber` wrapper that extracts the native slice with `lipo -thin` and caches it, and a `~/.latexmkrc` line pointing latexmk at it (`$biber = "$ENV{HOME}/.local/bin/biber %O %S";`). A user rc file counts as executable build configuration, so non-controlled builds stop using the full build cache while it exists.
+
 ## How it works
 
-Each project is a normal git clone of its Overleaf repo, kept under `repoDir` (or `localPath`). `sync_project` is the only synchronization command. Read, search, lint, dependency, render and build tools use the existing clone without pulling. This gives a task a stable source snapshot and prevents a read from replacing local edits. Git runs through `execFile` with argument arrays (no shell), so file paths, commit messages, and patterns can't inject commands. Authentication uses an inline git credential helper that reads the token from the process environment, so the token is never written into a remote URL, a command line, or an error message; the clone's `origin` stays token-free.
+Each project is a normal git clone of its Overleaf repo, kept under `repoDir` (or `localPath`). `sync_project` is the only synchronization command. Read, search, lint, dependency, render and build tools use the existing clone without pulling. This gives a task a stable source snapshot and prevents a read from replacing local edits. Git runs through `execFile` with argument arrays (no shell), so file paths, commit messages, and patterns can't inject commands. Authentication uses an inline git credential helper that reads the token from the process environment, so the token is never written into a remote URL, a command line, or an error message. The clone's `origin` stays token-free.
 
 ## Testing & development
 
@@ -342,18 +357,18 @@ node --test            # run the full suite
 node --check overleaf-mcp-server.js
 ```
 
-Tests run the real client against a throwaway local bare repository that stands in for Overleaf, so the full edit/merge/conflict/upload/snapshot behaviour is exercised with no network and no real account. The `verify_build` log classifier is unit-tested on captured log strings; a single integration test compiles a trivial document and auto-skips when `latexmk` isn't installed, so the suite is green on any machine.
+Tests run the real client against a throwaway local bare repository that stands in for Overleaf, so the full edit/merge/conflict/upload/snapshot behaviour is exercised with no network and no real account. The `verify_build` log classifier is unit-tested on captured log strings. A single integration test compiles a trivial document and auto-skips when `latexmk` isn't installed, so the suite is green on any machine.
 
 ## Security
 
-- `projects.json` is gitignored; never commit a real token.
-- The token is supplied to git through an environment-backed credential helper and never appears in a command string, a remote URL, or an error. Any tokenized URL that could surface in an error is redacted before it is returned. Rotate by updating `settings.gitToken`; it applies on the next call.
+- `projects.json` is gitignored. Never commit a real token.
+- The token is supplied to git through an environment-backed credential helper and never appears in a command string, a remote URL, or an error. Any tokenized URL that could surface in an error is redacted before it is returned. Rotate by updating `settings.gitToken`: it applies on the next call.
 - All subprocess calls use `execFile` (no shell), so paths, commit messages, and section titles cannot inject shell commands.
 - `upload_file` destinations are resolved and confined inside the project clone (no `..` escape, no absolute paths, not the `.git` directory).
 
 ## Origin & credits
 
-Forked from [mjyoo2/OverleafMCP](https://github.com/mjyoo2/OverleafMCP). The original established the git-integration approach and the base read/write/compile tools; this fork reworked the edit path for conflict safety, hardened the git layer, and added the verification, figure, citation, snapshot, voice, bootstrap, and context tooling.
+Forked from [mjyoo2/OverleafMCP](https://github.com/mjyoo2/OverleafMCP). The original established the git-integration approach and the base read/write/compile tools. This fork reworked the edit path for conflict safety, hardened the git layer, and added the verification, figure, citation, snapshot, voice, bootstrap, and context tooling.
 
 ## License
 

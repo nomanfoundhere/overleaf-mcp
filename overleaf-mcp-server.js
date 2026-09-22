@@ -20,6 +20,7 @@ import { applyChanges, publishChanges } from './transactions.js';
 import { observeTool, usageStats, toolError } from './runtime-observability.js';
 import { versionedContext, buildFingerprint, sectionBundle, sectionText, controlledBuildOptions } from './efficiency.js';
 const verifiedBuilds = new Map();
+const recentPasses = new Map();
 const buildQueues = new Map();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -594,12 +595,22 @@ class OverleafGitClient {
   async _verifyLocal(filePath, engine, options = {}) {
     const { force = false, clean = true } = options;
     const config = controlledBuildOptions(options);
-    const key = JSON.stringify([this.repoPath,filePath,engine,config]);
+    // Resolved so the gate (client.repoPath) and publish (path.resolve(root)) share a key.
+    const key = JSON.stringify([path.resolve(this.repoPath),filePath,engine,config]);
     const fingerprint = () => buildFingerprint(this.repoPath,filePath,engine,config).catch(()=>null);
     const sources = () => buildFingerprint(this.repoPath,filePath,engine,{...config,sourcesOnly:true});
     const cached = verifiedBuilds.get(key);
     const before = await sources();
     if (!force && cached && cached.fingerprint === await fingerprint()) return { ...cached.verdict, reused: true };
+    // publish_changes re-verifies a commit the final gate usually just passed.
+    // Projects with executable config (rc files, minted, shell escape) never
+    // qualify for the full cache above, so without this every publish would
+    // rebuild from scratch. Reuse is allowed only when every project file is
+    // byte-identical to the state right after that PASS (the sources hash
+    // covers tracked and untracked files, the environment and the day) within
+    // this process. Not covered: a TeX installation change in between.
+    const recent = recentPasses.get(key);
+    if (options.reuseRecentPass && !force && recent && recent.sources === before) return { ...recent.verdict, reused: true };
     verifiedBuilds.delete(key);
     const { log: runLog, pdfPath, commandFailed } = await this._runLatexmk(filePath,engine,{clean,controlled:config.controlled});
     const logPath = path.join(this.repoPath,filePath.replace(/\.tex$/,'.log'));
@@ -618,6 +629,8 @@ class OverleafGitClient {
     const print = before && before === after ? await fingerprint() : null;
     verdict.cacheEligible = Boolean(print);
     if (verdict.pass && print) verifiedBuilds.set(key,{ fingerprint:print,verdict });
+    if (verdict.pass && before === after) recentPasses.set(key, { sources: after, verdict });
+    else recentPasses.delete(key);
     return verdict;
   }
 
@@ -940,8 +953,10 @@ function voiceLinterCommand(config) {
 // commits still waiting for publish_changes.
 function mutationTail(res, what) {
   if (res.pushed) return `${what} and pushed to Overleaf${res.merged ? ' (auto-merged a concurrent Overleaf change)' : ''}.`;
-  const n = res.unpublished == null ? 'unknown' : res.unpublished;
-  return `${what} and committed locally (HEAD ${res.head.slice(0, 12)}; ${n} unpublished commit(s)). NEXT: finish the batch, verify_build, then publish_changes with revision ${res.head} once publishing is authorized.`;
+  // The full hash is what publish_changes takes as revision; the workflow
+  // itself lives in the tool descriptions, not in every reply.
+  const n = res.unpublished == null ? '' : `, ${res.unpublished} unpublished`;
+  return `${what}; committed locally at ${res.head}${n}.`;
 }
 
 async function getClient(projectName) {
@@ -1118,7 +1133,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       ['render_pages', 'Render explicitly selected PDF pages to cached local PNG paths. Pages are one-based; no sync or build.', { filePath: { type: 'string' }, pages: { type: 'array', items: { type: 'integer', minimum: 1 }, minItems: 1, maxItems: 20 }, dpi: { type: 'integer', minimum: 36, maximum: 300 } }, ['filePath', 'pages']],
       ['usage_stats', 'In-process tool counts, durations, response bytes and cache hits. Stores no document content. Bytes are not billed tokens.', { reset: { type: 'boolean' } }, []],
       ['apply_changes', 'Verify a UTF-8 multi-file batch in an isolated worktree, then commit it locally. Requires clean tracked source, HEAD baseRevision and SHA-256 baseHash per file (null for new files). No push.', { baseRevision: { type: 'string' }, changes: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'object', properties: { filePath: { type: 'string' }, baseHash: { type: ['string', 'null'] }, content: { type: 'string' } }, required: ['filePath', 'baseHash', 'content'] } }, filePath: { type: 'string' }, engine: { type: 'string' }, controlled: { type: 'boolean' }, externalInputs: { type: 'array', items: { type: 'string' } }, lint: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] } }, ['baseRevision', 'changes', 'filePath']],
-      ['publish_changes', 'Verify the clean local HEAD and push it once, publishing every unpublished local commit (from apply_changes or local-mode edit tools) together. revision must equal HEAD. No pull, retry, merge or reset; if Overleaf moved, run sync_project first. Requires publishing authorization.', { revision: { type: 'string' }, filePath: { type: 'string' }, engine: { type: 'string' }, controlled: { type: 'boolean' }, externalInputs: { type: 'array', items: { type: 'string' } }, lint: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] } }, ['revision', 'filePath']],
+      ['publish_changes', 'Verify the clean local HEAD and push every unpublished commit once. revision must equal HEAD. Reuses this session\'s verify_build PASS when no project file changed since; force rebuilds. No pull, merge or retry: if Overleaf moved, sync_project first. Needs publishing authorization.', { revision: { type: 'string' }, force: { type: 'boolean' }, filePath: { type: 'string' }, engine: { type: 'string' }, controlled: { type: 'boolean' }, externalInputs: { type: 'array', items: { type: 'string' } }, lint: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] } }, ['revision', 'filePath']],
     ].map(([name, description, properties, required]) => ({ name, description, inputSchema: { type: 'object', properties: { projectName: { type: 'string' }, ...properties }, required } })),
     {
       name: 'get_context',
@@ -1258,7 +1273,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'sync_project',
-      description: 'Fetch Overleaf and reconcile the local clone. Fast-forwards when only behind; reports unpublished local commits when ahead. On divergence it changes nothing and returns both sides, unless strategy is given: "rebase" replays local commits onto Overleaf (aborts cleanly on conflict); "reset" discards local work to match Overleaf, requires confirm set to the reported local head, and tags mcp-backup/* first. Clones when no local copy exists. Builds and reads never sync.',
+      description: 'Fetch Overleaf. Fast-forwards when behind; reports unpublished commits when ahead. On divergence it changes nothing and reports both sides unless strategy is "rebase" (aborts cleanly on conflict) or "reset" (needs confirm = the reported head; tags mcp-backup/* first). Clones a missing project.',
       inputSchema: { type: 'object', properties: {
         strategy: { type: 'string', enum: ['rebase', 'reset'], description: 'Only for a diverged clone. Omit to get the report first.' },
         confirm: { type: 'string', description: 'For strategy "reset": the full local head SHA from the report.' },
@@ -1282,7 +1297,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'verify_build',
-      description: 'Build the local entrypoint and return a PASS/FAIL verdict on the done-bar: PASS only if a PDF is produced with zero LaTeX errors, zero undefined references and zero undefined citations (and, with lint, zero voice-linter findings). Reports page count; overfull/underfull boxes are warnings. Default is the final gate: a clean from-scratch build, reusing an unchanged eligible PASS unless force is true. clean:false is a quick incremental rebuild for intermediate layout checks. Local only; no pull.',
+      description: 'Build the entrypoint and return PASS/FAIL. PASS needs a PDF, zero LaTeX errors and zero undefined references and citations (and zero findings with lint); box warnings do not fail. Default: clean from-scratch final gate, reusing an unchanged eligible PASS unless force. clean:false: quick incremental rebuild for intermediate checks. Local only.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1301,7 +1316,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'edit_file',
-      description: 'Surgical, conflict-safe edit: replace oldString with newString in a file and commit. Commits locally by default (push:false unless settings.autoPush); publish_changes sends the verified batch. PREFER this over write_file for edits to existing files — it is far cheaper than a full rewrite and it cannot silently clobber a concurrent Overleaf edit (a missing oldString means the region changed; the edit refuses). When pushing, non-overlapping concurrent Overleaf edits auto-merge. oldString must match exactly once unless replaceAll is true. After the edit batch, use verify_build as the single final gate.',
+      description: 'Anchored edit: replace oldString (must match once unless replaceAll) with newString and commit. A missing anchor means the region changed, so the edit refuses instead of clobbering it. Prefer over write_file for existing files. Commits locally unless push.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1310,7 +1325,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           newString: { type: 'string', description: 'Replacement text.' },
           replaceAll: { type: 'boolean', description: 'Replace every occurrence (default false; otherwise oldString must be unique).' },
           commitMessage: { type: 'string' },
-          push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' },
+          push: { type: 'boolean', description: 'Push now. Default settings.autoPush; false keeps a local commit for publish_changes.' },
           projectName: { type: 'string' },
         },
         required: ['filePath', 'oldString', 'newString'],
@@ -1318,7 +1333,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'write_file',
-      description: 'Create a new file, or overwrite an existing one wholesale, and commit (local by default; see push). For edits to existing files prefer edit_file. Overwriting an existing file requires either baseSha (from read_file, so a stale write is refused) or overwrite:true. After the edit batch, use verify_build as the single final gate.',
+      description: 'Create a file or replace one wholesale, and commit. Replacing needs baseSha from read_file (a stale one is refused) or overwrite:true. Prefer edit_file for changes. Commits locally unless push.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1327,7 +1342,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           baseSha: { type: 'string', description: 'The baseSha from read_file for this file. Required to overwrite an existing file safely; if Overleaf moved since, the write is refused.' },
           overwrite: { type: 'boolean', description: 'Force-overwrite an existing file without a baseSha (deliberate full replacement). Ignored for new files.' },
           commitMessage: { type: 'string' },
-          push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' },
+          push: { type: 'boolean', description: 'Push now. Default settings.autoPush; false keeps a local commit for publish_changes.' },
           projectName: { type: 'string' },
         },
         required: ['filePath', 'content'],
@@ -1335,7 +1350,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'upload_file',
-      description: 'Upload a binary file (PNG/PDF figure, etc.) from a local disk path INTO the Overleaf project and commit (local by default; see push). write_file/edit_file are UTF-8 only — use this for binaries. Single: srcPath + destPath. Batch (one commit for a figure set): files: [{srcPath, destPath}, ...]. Existing dest files need baseSha (single mode, from read_file) or overwrite:true. After uploading, reference each figure with \\includegraphics{...} via edit_file, then verify_build.',
+      description: 'Copy binary file(s) such as figures from a local path into the project and commit. Single: srcPath + destPath; batch: files[] in one commit. Existing destinations need baseSha (single) or overwrite:true. Commits locally unless push.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1349,7 +1364,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           baseSha: { type: 'string', description: 'Single-file mode only: baseSha from read_file; a stale value is refused. Ignored in batch.' },
           overwrite: { type: 'boolean', description: 'Replace existing dest file(s). Required to overwrite in batch mode.' },
           commitMessage: { type: 'string' },
-          push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' },
+          push: { type: 'boolean', description: 'Push now. Default settings.autoPush; false keeps a local commit for publish_changes.' },
           projectName: { type: 'string' },
         },
       },
@@ -1377,7 +1392,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           entry: { type: 'string', description: 'A complete BibTeX entry, e.g. @article{key, title={...}, ...}.' },
           commitMessage: { type: 'string' },
-          push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' },
+          push: { type: 'boolean', description: 'Push now. Default settings.autoPush; false keeps a local commit for publish_changes.' },
           projectName: { type: 'string' },
         },
         required: ['entry'],
@@ -1396,11 +1411,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'restore',
       description: 'Roll back to a checkpoint: re-applies the snapshot\'s file tree as a NEW commit on top of history (no force-push, no history rewrite); intervening commits are preserved. Local by default; see push.',
-      inputSchema: { type: 'object', properties: { label: { type: 'string' }, push: { type: 'boolean', description: 'Push to Overleaf now. Defaults to settings.autoPush (false unless configured): the change stays a local commit until publish_changes sends the verified batch.' }, projectName: { type: 'string' } }, required: ['label'] },
+      inputSchema: { type: 'object', properties: { label: { type: 'string' }, push: { type: 'boolean', description: 'Push now. Default settings.autoPush; false keeps a local commit for publish_changes.' }, projectName: { type: 'string' } }, required: ['label'] },
     },
     {
       name: 'voice_lint',
-      description: 'Lint a .tex file for prose issues. Runs a bundled generic example linter by default; override with settings.voiceLinter in projects.json or the OVERLEAF_VOICE_LINTER env var (a command that takes a file path and exits non-zero on findings). Lints the LOCAL working copy as-is and never pulls, so it reflects on-disk state including edits not yet pushed; if the project has not been cloned locally yet it errors rather than fetching. Read-only and advisory on its own; verify_build with lint makes findings fail the final gate. Useful after editing prose via edit_file/write_file, which bypass any local editor hooks.',
+      description: 'Run the prose linter (settings.voiceLinter, else the bundled example) on a local .tex file; never pulls. Advisory on its own; verify_build with lint makes findings fail the gate.',
       inputSchema: {
         type: 'object',
         properties: { filePath: { type: 'string' }, projectName: { type: 'string' } },
@@ -1747,6 +1762,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeTool(r
             externalInputs: args.externalInputs,
             lint: args.lint,
             lintCommand: voiceLinterCommand(config),
+            reuseRecentPass: name === 'publish_changes' && args.force !== true,
           });
         };
         const result = name === 'apply_changes' ? await applyChanges(client.repoPath, args, verify)
@@ -1771,12 +1787,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => observeTool(r
         const v = args.clean === false
           ? await client.compileFile(args.filePath, args.engine || 'lualatex', opts)
           : await client.verifyBuild(args.filePath, args.engine || 'lualatex', opts);
-        const parts = [`${v.pass ? 'PASS' : 'FAIL'}: ${v.pageCount ?? '?'} pages; ${v.errors.length} errors; ${v.undefinedRefs.length} undefined references; ${v.undefinedCitations.length} undefined citations; ${v.overfullCount} overfull / ${v.underfullCount} underfull boxes.`,
-          `Reused verification: ${v.reused}. Full log: ${v.logPath}`];
-        if (!v.pass) parts.push(...v.errors.slice(0,5),...v.undefinedRefs.slice(0,5),...v.undefinedCitations.slice(0,5));
+        // A PASS already means zero errors and zero undefined references and
+        // citations, so only box warnings and reuse are worth reporting. A FAIL
+        // carries the counts, the first offenders and where the full log is.
+        const boxes = v.overfullCount || v.underfullCount ? `; ${v.overfullCount} overfull / ${v.underfullCount} underfull boxes` : '';
+        const parts = v.pass
+          ? [`PASS: ${v.pageCount ?? '?'} pages${boxes}${v.reused ? ' (reused unchanged verification)' : ''}.`]
+          : [`FAIL: ${v.pageCount ?? '?'} pages; ${v.errors.length} errors; ${v.undefinedRefs.length} undefined references; ${v.undefinedCitations.length} undefined citations${boxes}. Log: ${path.relative(client.repoPath, v.logPath)}`,
+            ...v.errors.slice(0,5),...v.undefinedRefs.slice(0,5),...v.undefinedCitations.slice(0,5)];
         if (v.lint) parts.push(v.lint.clean ? `Voice lint: clean (${v.lint.results.length} file(s)).` : `Voice lint findings:\n${v.lint.results.filter(r => !r.clean).map(r => `${r.file}:\n${r.findings}`).join('\n')}`);
         if (args.verbose) parts.push(v.tail);
-        if (!v.cacheEligible && !v.reused) parts.push('Cache not retained: dependency closure unavailable, executable configuration, or changing inputs.');
         return { content:[{type:'text',text:parts.join('\n')}], structuredContent: { pass: v.pass, pageCount: v.pageCount, reused: v.reused, cacheEligible: v.cacheEligible, errors: v.errors.slice(0,5), logPath: v.logPath, lintClean: v.lint ? v.lint.clean : null } };
       }
 

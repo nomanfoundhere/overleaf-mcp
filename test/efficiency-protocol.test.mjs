@@ -13,7 +13,7 @@ test('fresh MCP exposes compact local tools and context version round trip',asyn
  await writeFile(path.join(home,'writing-guidelines.md'),'Small guide');
  await writeFile(path.join(home,'projects.json'),JSON.stringify({settings:{gitToken:'unused'},projects:{test:{name:'Test',projectId:'test',localPath:repo}}}));
  const client=new Client({name:'test',version:'1'});
- await client.connect(new StdioClientTransport({command:process.execPath,args:[path.resolve('overleaf-mcp-server.js')],env:{...process.env,OVERLEAF_MCP_HOME:home},stderr:'pipe'}));
+ await client.connect(new StdioClientTransport({command:process.execPath,args:[path.resolve('overleaf-mcp-server.js')],env:{...process.env,OVERLEAF_MCP_HOME:home,HOME:home,XDG_CONFIG_HOME:path.join(home,'.config')},stderr:'pipe'}));
  t.after(()=>client.close());
  const listed=await client.listTools();assert.ok(listed.tools.some(x=>x.name==='sync_project'));
  for (const name of ['dependency_index','change_report','render_pages','usage_stats','apply_changes','publish_changes']) assert.ok(listed.tools.some(x=>x.name===name));
@@ -23,7 +23,7 @@ test('fresh MCP exposes compact local tools and context version round trip',asyn
  assert.equal(again.structuredContent.unchanged,true);assert.doesNotMatch(again.content[0].text,/Small guide/);
  const b=await client.callTool({name:'get_section_content',arguments:{projectName:'test',filePath:'main.tex',sectionTitle:'Intro',bundle:true}});assert.equal(b.isError,undefined);assert.match(b.content[0].text,/Hello/);
  const v=await client.callTool({name:'verify_build',arguments:{projectName:'test',filePath:'main.tex',engine:'pdflatex'}});assert.match(v.content[0].text,/PASS/);assert.doesNotMatch(v.content[0].text,/Log tail|LuaHBTeX/);
- const r=await client.callTool({name:'verify_build',arguments:{projectName:'test',filePath:'main.tex',engine:'pdflatex'}});assert.match(r.content[0].text,/Reused verification: true/);
+ const r=await client.callTool({name:'verify_build',arguments:{projectName:'test',filePath:'main.tex',engine:'pdflatex'}});assert.match(r.content[0].text,/reused unchanged verification/);assert.doesNotMatch(v.content[0].text,/undefined|Log:|Cache/);
  await writeFile(path.join(repo,'.latexmkrc'),'die "Project rc must not execute in controlled mode";\n');
  const controlled=await client.callTool({name:'verify_build',arguments:{projectName:'test',filePath:'main.tex',engine:'pdflatex',controlled:true}});
  assert.equal(controlled.structuredContent.pass,true);assert.equal(controlled.structuredContent.cacheEligible,true);
