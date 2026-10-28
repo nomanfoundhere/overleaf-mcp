@@ -18,7 +18,14 @@ import { dependencyIndex, changeReport } from './dependency-index.js';
 import { renderPages } from './render-cache.js';
 import { applyChanges, publishChanges } from './transactions.js';
 import { observeTool, usageStats, toolError } from './runtime-observability.js';
-import { versionedContext, buildFingerprint, sectionBundle, sectionText, controlledBuildOptions } from './efficiency.js';
+import { versionedContext, buildFingerprint, sectionBundle, sectionText, controlledBuildOptions, recorderOutputs, sourceSnapshot, snapshotKey } from './efficiency.js';
+// A wall-clock guard against a hung build, not a budget for a slow one: with
+// -interaction=nonstopmode nothing waits for input, and latexmk caps its reruns.
+// The 161-page 2DW10 book builds clean in 127 s (measured 2026-10-28, five
+// lualatex passes) once changebar's stacks are O(1) (lecture-notes skill,
+// templates/cbstack-patch.tex), against 689 s with stock changebar. 600 s is
+// about 4.7 times the patched build. Override with OVERLEAF_MCP_BUILD_TIMEOUT_MS.
+const buildTimeoutMs = () => Number(process.env.OVERLEAF_MCP_BUILD_TIMEOUT_MS) || 600000;
 const verifiedBuilds = new Map();
 const recentPasses = new Map();
 const buildQueues = new Map();
@@ -481,10 +488,22 @@ class OverleafGitClient {
     if (clean) args.push('-gg');
     args.push(filePath);
     let commandFailed = false;
-    const { stdout, stderr } = await execFile(
+    // latexmk runs in its own process group so a timeout stops the whole tree.
+    // Killing latexmk alone left lualatex writing on, and a pass cut off mid-write
+    // truncates aux files (changebar's .cb) that fail every later build.
+    const run = execFile(
       path.join(texbin, 'latexmk'), args,
-      { cwd: this.repoPath, timeout: 180000, maxBuffer: 20 * 1024 * 1024, env }
-    ).catch(e => { commandFailed = true; return { stdout: e.stdout || '', stderr: e.stderr || e.message }; });
+      { cwd: this.repoPath, maxBuffer: 20 * 1024 * 1024, env, detached: true }
+    );
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-run.child.pid, 'SIGTERM'); } catch { /* group already gone */ }
+    }, buildTimeoutMs());
+    const { stdout, stderr } = await run
+      .catch(e => { commandFailed = true; return { stdout: e.stdout || '', stderr: e.stderr || e.message }; })
+      .finally(() => clearTimeout(timer));
+    if (timedOut) return { stdout, stderr, commandFailed: true, timedOut, log: `${stdout}\n${stderr}`, pdfPath: null };
     const pdfPath = path.join(this.repoPath, filePath.replace(/\.tex$/, '.pdf'));
     let pdfExists = false;
     try { await access(pdfPath); pdfExists = true; } catch { /* no pdf */ }
@@ -598,9 +617,15 @@ class OverleafGitClient {
     // Resolved so the gate (client.repoPath) and publish (path.resolve(root)) share a key.
     const key = JSON.stringify([path.resolve(this.repoPath),filePath,engine,config]);
     const fingerprint = () => buildFingerprint(this.repoPath,filePath,engine,config).catch(()=>null);
-    const sources = () => buildFingerprint(this.repoPath,filePath,engine,{...config,sourcesOnly:true});
+    // Sources are every project file the build does not write itself. The
+    // recorder's OUTPUT lines from the last build and from this one are left
+    // out of both snapshots, so a package that rewrites its own auxiliary file
+    // on every run (changebar's .cb/.cb2) cannot pass for an edited input.
+    const snapshot = () => sourceSnapshot(this.repoPath,filePath,engine,config);
+    const sourcesKey = (snap, outputs) => snapshotKey(snap,outputs,engine,filePath,config);
     const cached = verifiedBuilds.get(key);
-    const before = await sources();
+    const outputsBefore = await recorderOutputs(this.repoPath,filePath);
+    const snapBefore = await snapshot();
     if (!force && cached && cached.fingerprint === await fingerprint()) return { ...cached.verdict, reused: true };
     // publish_changes re-verifies a commit the final gate usually just passed.
     // Projects with executable config (rc files, minted, shell escape) never
@@ -610,26 +635,29 @@ class OverleafGitClient {
     // covers tracked and untracked files, the environment and the day) within
     // this process. Not covered: a TeX installation change in between.
     const recent = recentPasses.get(key);
-    if (options.reuseRecentPass && !force && recent && recent.sources === before) return { ...recent.verdict, reused: true };
+    if (options.reuseRecentPass && !force && recent && recent.sources === sourcesKey(snapBefore, recent.outputs)) return { ...recent.verdict, reused: true };
     verifiedBuilds.delete(key);
-    const { log: runLog, pdfPath, commandFailed } = await this._runLatexmk(filePath,engine,{clean,controlled:config.controlled});
+    const { log: runLog, pdfPath, commandFailed, timedOut } = await this._runLatexmk(filePath,engine,{clean,controlled:config.controlled});
     const logPath = path.join(this.repoPath,filePath.replace(/\.tex$/,'.log'));
     let finalLog = runLog;
     try { finalLog = await readFile(logPath,'utf8'); } catch { /* failed before log creation */ }
     const verdict = classifyBuildLog(finalLog);
-    if (commandFailed) verdict.errors.push('latexmk command failed; any previous PDF is not a successful build.');
+    if (timedOut) verdict.errors.push(`Build stopped after ${buildTimeoutMs() / 1000} s (OVERLEAF_MCP_BUILD_TIMEOUT_MS). Aux files written by the cut-off pass may be incomplete; rebuild with clean:true.`);
+    else if (commandFailed) verdict.errors.push('latexmk command failed; any previous PDF is not a successful build.');
     verdict.pdfProduced = pdfPath !== null;
     verdict.pass = verdict.pdfProduced && !verdict.errors.length && !verdict.undefinedRefs.length && !verdict.undefinedCitations.length;
     verdict.logPath = logPath;
     verdict.pdfPath = pdfPath;
     verdict.tail = (commandFailed ? runLog : finalLog).slice(-2500);
     verdict.reused = false;
-    const after = await sources();
-    if (before && before !== after) { verdict.pass = false; verdict.errors.push('Project inputs changed during the build; verify the latest source again.'); }
-    const print = before && before === after ? await fingerprint() : null;
+    const outputs = new Set([...outputsBefore, ...(await recorderOutputs(this.repoPath,filePath))]);
+    const before = sourcesKey(snapBefore, outputs);
+    const after = sourcesKey(await snapshot(), outputs);
+    if (before !== after) { verdict.pass = false; verdict.errors.push('Project inputs changed during the build; verify the latest source again.'); }
+    const print = before === after ? await fingerprint() : null;
     verdict.cacheEligible = Boolean(print);
     if (verdict.pass && print) verifiedBuilds.set(key,{ fingerprint:print,verdict });
-    if (verdict.pass && before === after) recentPasses.set(key, { sources: after, verdict });
+    if (verdict.pass && before === after) recentPasses.set(key, { sources: after, outputs, verdict });
     else recentPasses.delete(key);
     return verdict;
   }

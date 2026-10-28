@@ -48,6 +48,25 @@ test('local verification reuses unchanged output, invalidates edits and deleted 
  assert.equal((await c.verifyBuild('main.tex','pdflatex')).reused,false);
  await c.verifyBuild('main.tex','pdflatex',{force:true});assert.equal(calls,4);
 });
+test('files the build itself writes (changebar main.cb/.cb2) are not inputs that changed during the build',async t=>{
+ const {root,c}=await fixture(t);
+ await writeFile(path.join(root,'main.tex'),'\\documentclass{article}\\usepackage{changebar}\\begin{document}\\cbstart Hello\\cbend\\end{document}\n');
+ const v=await c.verifyBuild('main.tex','pdflatex');
+ assert.deepEqual(v.errors,[]); assert.equal(v.pass,true);
+ assert.equal((await c.verifyBuild('main.tex','pdflatex')).pass,true);
+ await writeFile(path.join(root,'main.tex'),'\\documentclass{article}\\usepackage{changebar}\\begin{document}\\cbstart Edited\\cbend\\end{document}\n');
+ assert.equal((await c.verifyBuild('main.tex','pdflatex')).reused,false);
+});
+test('a build past the timeout stops, fails with the reason, and leaves no TeX process behind',async t=>{
+ const {root,c}=await fixture(t);
+ process.env.OVERLEAF_MCP_BUILD_TIMEOUT_MS='300'; t.after(()=>{delete process.env.OVERLEAF_MCP_BUILD_TIMEOUT_MS;});
+ await writeFile(path.join(root,'main.tex'),'\\documentclass{article}\\begin{document}\\count255=0 \\loop\\advance\\count255 1 \\ifnum\\count255<2000000000 \\repeat x\\end{document}\n');
+ const v=await c.verifyBuild('main.tex','pdflatex');
+ assert.equal(v.pass,false); assert.match(v.errors.join(' '),/Build stopped after 0.3 s/);
+ const {execFile}=await import('node:child_process');
+ const ps=await new Promise(r=>execFile('pgrep',['-f',root],(e,out)=>r(out||'')));
+ assert.equal(ps.trim(),'');
+});
 test('failed command cannot pass using stale PDF and clean log',async t=>{
  const {root,c}=await fixture(t);
  await writeFile(path.join(root,'main.pdf'),'old PDF');

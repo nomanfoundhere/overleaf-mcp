@@ -124,8 +124,11 @@ async function renderOne(snapshotFile, root, key, page, dpi) {
   const work = await mkdtemp(path.join(root, '.render-'));
   try {
     const prefix = path.join(work, 'page');
-    await execFile('pdftoppm', ['-png', '-r', String(dpi), '-f', String(page), '-l', String(page), snapshotFile, prefix], { encoding: 'utf8' });
-    const generated = path.join(work, `page-${page}.png`);
+    // -singlefile writes exactly `${prefix}.png`. Without it pdftoppm appends the page number,
+    // zero-padded to the digit count of the document's last page (page-005.png in a 115-page PDF),
+    // so a name built from `page` alone misses every page once the PDF reaches 10 or 100 pages.
+    await execFile('pdftoppm', ['-png', '-singlefile', '-r', String(dpi), '-f', String(page), '-l', String(page), snapshotFile, prefix], { encoding: 'utf8' });
+    const generated = `${prefix}.png`;
     if (!(await existingFile(generated, work))) throw new Error(`pdftoppm produced no output for page ${page}`);
     await rename(generated, finalFile);
     return { file: finalFile, hit: false };

@@ -34,11 +34,56 @@ export function latexmkUserRcFiles(env = process.env, home = os.homedir()) {
   ].filter(Boolean);
 }
 
-export async function buildFingerprint(root, entry, engine, options = {}) {
-  const { sourcesOnly, controlled, externalInputs } = controlledBuildOptions(options);
-  const records = [];
+// Files the last build wrote, from the TeX recorder (OUTPUT lines of <job>.fls).
+// A package can write any auxiliary file (changebar's .cb/.cb2, a test .tmp),
+// so the recorder, not an extension list, says which files are build output.
+export async function recorderOutputs(root, entry) {
+  const job = path.resolve(root, entry.replace(/\.tex$/, ''));
+  const fls = await readFile(`${job}.fls`, 'utf8').catch(() => '');
+  return new Set(fls.split(/\r?\n/).filter(l => l.startsWith('OUTPUT ')).map(l => path.resolve(root, l.slice(7))));
+}
+
+// Content hashes of every project source, keyed by path. The before/after
+// comparison in a build needs per-file records, because which files count as
+// output is only known once the build has run.
+export async function sourceSnapshot(root, entry, engine, options = {}) {
+  const { controlled, externalInputs } = controlledBuildOptions(options);
   const job = path.resolve(root, entry.replace(/\.tex$/, ''));
   const generated = new Set(['aux','log','pdf','fls','fdb_latexmk','synctex.gz','toc','out','bbl','bcf','blg','run.xml','lof','lot'].map(e => `${job}.${e}`));
+  const records = new Map();
+  const visit = async dir => {
+    for (const d of (await readdir(dir, { withFileTypes: true })).sort((a,b)=>a.name.localeCompare(b.name))) {
+      if (d.name === '.git' || d.isSymbolicLink()) continue;
+      const f = path.join(dir,d.name);
+      if (d.isDirectory()) await visit(f);
+      else if (d.isFile() && !generated.has(f)) records.set(f, hash(await readFile(f)));
+    }
+  };
+  await visit(root);
+  if (!controlled) for (const rc of latexmkUserRcFiles()) {
+    const bytes = await readFile(rc).catch(() => null);
+    if (bytes !== null) records.set(rc, hash(bytes));
+  }
+  for (const input of externalInputs) {
+    const stat = await lstat(input).catch(() => null);
+    if (!stat || !stat.isFile() || stat.isSymbolicLink()) throw new Error(`external input must be a regular non-symlink file: ${input}`);
+    records.set(input, hash(await readFile(input)));
+  }
+  return records;
+}
+
+// One key for a snapshot with the given build outputs left out.
+export function snapshotKey(snapshot, outputs, engine, entry, options = {}) {
+  const { controlled, externalInputs } = controlledBuildOptions(options);
+  const records = [...snapshot].filter(([f]) => !outputs.has(f)).sort(([a],[b]) => a.localeCompare(b));
+  return hash(JSON.stringify([engine,entry,process.env,new Date().toDateString(),{ controlled, externalInputs },records]));
+}
+
+export async function buildFingerprint(root, entry, engine, options = {}) {
+  const { sourcesOnly, controlled, externalInputs } = controlledBuildOptions(options);
+  if (sourcesOnly) return snapshotKey(await sourceSnapshot(root, entry, engine, options), await recorderOutputs(root, entry), engine, entry, options);
+  const records = [];
+  const job = path.resolve(root, entry.replace(/\.tex$/, ''));
   let unsafe = false;
   const visit = async dir => {
     for (const d of (await readdir(dir, { withFileTypes: true })).sort((a,b)=>a.name.localeCompare(b.name))) {
@@ -46,7 +91,7 @@ export async function buildFingerprint(root, entry, engine, options = {}) {
       const f = path.join(dir,d.name);
       if (d.isSymbolicLink()) { unsafe = true; continue; }
       if (d.isDirectory()) await visit(f);
-      else if (d.isFile() && !(sourcesOnly && generated.has(f))) {
+      else if (d.isFile()) {
         const bytes = await readFile(f);
         records.push([f,hash(bytes)]);
         // Executable config and shell/Lua-driven generation can read dependencies
@@ -73,16 +118,14 @@ export async function buildFingerprint(root, entry, engine, options = {}) {
     if (!stat || !stat.isFile() || stat.isSymbolicLink()) throw new Error(`external input must be a regular non-symlink file: ${input}`);
     records.push([input, hash(await readFile(input))]);
   }
-  if (unsafe && !sourcesOnly) return null;
-  if (!sourcesOnly) {
-    const fls = await readFile(`${job}.fls`,'utf8');
-    const inputs = new Set(fls.split(/\r?\n/).filter(l=>l.startsWith('INPUT ')).map(l=>path.resolve(root,l.slice(6))));
-    if (!inputs.size) return null;
-    for (const f of [...inputs].sort()) records.push([await realpath(f),hash(await readFile(f))]);
-    for (const tool of ['latexmk',engine]) {
-      const f = await realpath(`/Library/TeX/texbin/${tool}`);
-      records.push([f,hash(await readFile(f))]);
-    }
+  if (unsafe) return null;
+  const fls = await readFile(`${job}.fls`,'utf8');
+  const inputs = new Set(fls.split(/\r?\n/).filter(l=>l.startsWith('INPUT ')).map(l=>path.resolve(root,l.slice(6))));
+  if (!inputs.size) return null;
+  for (const f of [...inputs].sort()) records.push([await realpath(f),hash(await readFile(f))]);
+  for (const tool of ['latexmk',engine]) {
+    const f = await realpath(`/Library/TeX/texbin/${tool}`);
+    records.push([f,hash(await readFile(f))]);
   }
   return hash(JSON.stringify([engine,entry,process.env,new Date().toDateString(),{ controlled, externalInputs },records]));
 }

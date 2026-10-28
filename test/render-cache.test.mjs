@@ -60,3 +60,12 @@ test('rejects invalid pages and project escaping paths', async t => {
   await assert.rejects(renderPages(fixture.root, { ...fixture, pages: [0] }), /positive integers/);
   await assert.rejects(renderPages(fixture.root, { ...fixture, filePath: '../outside.pdf', pages: [1] }), /inside project/);
 });
+
+test('renders pages whose number has fewer digits than the page count (pdftoppm zero-pads them)', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'render-cache-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, 'long.pdf'), pdfBytes(101));
+  const result = await renderPages(root, { filePath: 'long.pdf', cacheDir: path.join(root, 'cache'), pages: [5, 42, 101], dpi: 72 });
+  assert.equal(result.files.length, 3);
+  for (const file of result.files) assert.ok((await readFile(file)).length > 100);
+});
